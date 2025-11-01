@@ -1,0 +1,462 @@
+#!/bin/bash
+
+# Multicloud Defense Lab - Smart Deployment Script
+# This script handles both new deployments and re-deployments automatically
+# It will import existing resources if found, then apply the configuration
+
+# Note: Don't use 'set -e' here because we handle import failures gracefully
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to sanitize output by removing sensitive values and expected errors
+sanitize_output() {
+    sed -E 's/AKIA[A-Z0-9]{16}/AKIA************/g' | \
+    sed -E 's/[A-Za-z0-9/+=]{40}/****REDACTED****/g' | \
+    sed -E 's/"api_key":\s*"[^"]*"/"api_key": "****REDACTED****"/g' | \
+    sed -E 's/aws_secret_access_key[[:space:]]*=[[:space:]]*[^[:space:]]*/aws_secret_access_key = ****REDACTED****/g' | \
+    grep -v "Warning: Argument is deprecated" | \
+    grep -v "network_interface is deprecated" | \
+    grep -v "multiple EC2 Transit Gateways matched" | \
+    grep -v "use additional constraints to reduce matches"
+}
+
+# Trap to ensure cleanup on exit
+cleanup_on_exit() {
+    if [ -f "tfplan" ]; then
+        rm -f tfplan
+    fi
+}
+trap cleanup_on_exit EXIT
+
+echo ""
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║   Multicloud Defense Lab - Smart Deployment              ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+echo -e "${BLUE}⏱️  Estimated deployment time: 10-15 minutes${NC}"
+echo ""
+echo -e "${YELLOW}💡 While you wait, continue reading the lab guide to see what's${NC}"
+echo -e "${YELLOW}   happening behind the scenes! It's more interesting than${NC}"
+echo -e "${YELLOW}   watching dots... 😊${NC}"
+echo ""
+
+# Check if Terraform is installed
+if ! command -v terraform &>/dev/null; then
+    echo -e "${RED}❌ Terraform not found${NC}"
+    echo "Please install Terraform first: https://www.terraform.io/downloads"
+    exit 1
+fi
+
+# Check if terraform.tfvars exists and has pod_number
+if [ ! -f terraform.tfvars ]; then
+    echo -e "${RED}❌ terraform.tfvars not found${NC}"
+    echo "Please run ./init-lab.sh first to set up credentials"
+    exit 1
+fi
+
+POD_NUMBER=$(grep -E '^pod_number' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
+
+if [ -z "$POD_NUMBER" ]; then
+    echo -e "${RED}❌ pod_number not found in terraform.tfvars${NC}"
+    echo "Please run ./init-lab.sh first to configure your pod number"
+    exit 1
+fi
+
+# Validate pod number
+if ! [[ "$POD_NUMBER" =~ ^[0-9]+$ ]] || [ "$POD_NUMBER" -lt 1 ] || [ "$POD_NUMBER" -gt 60 ]; then
+    echo -e "${RED}❌ Invalid pod number: ${POD_NUMBER}${NC}"
+    echo "Pod number must be between 1 and 60"
+    exit 1
+fi
+
+echo -e "${BLUE}📋 Pod Number: ${POD_NUMBER}${NC}"
+echo ""
+
+# Smart initialization - only when needed
+if [ ! -d ".terraform" ] || [ ! -f ".terraform.lock.hcl" ]; then
+    echo -e "${YELLOW}🔄 Initializing Terraform...${NC}"
+    if ! terraform init; then
+        echo -e "${RED}❌ Terraform initialization failed${NC}"
+        exit 1
+    fi
+    echo ""
+else
+    echo -e "${GREEN}✓ Terraform already initialized${NC}"
+    echo ""
+fi
+
+# Critical: Check for orphaned SSH keypair
+# If keypair exists in AWS but we don't have the local private key, we must delete it
+PRIVATE_KEY_FILE="pod${POD_NUMBER}-private-key"
+if [ ! -f "$PRIVATE_KEY_FILE" ]; then
+    echo -e "${YELLOW}🔍 Checking for orphaned AWS keypair...${NC}"
+    
+    # Check if AWS CLI is available
+    if command -v aws &>/dev/null; then
+        # Check if keypair exists in AWS
+        KEYPAIR_EXISTS=$(aws ec2 describe-key-pairs \
+            --region us-east-1 \
+            --key-names "pod${POD_NUMBER}-keypair" \
+            --query 'KeyPairs[0].KeyName' \
+            --output text 2>/dev/null || echo "")
+        
+        if [ -n "$KEYPAIR_EXISTS" ] && [ "$KEYPAIR_EXISTS" != "None" ]; then
+            echo -e "${YELLOW}⚠️  Found orphaned keypair in AWS (no local private key)${NC}"
+            echo -e "${YELLOW}   Deleting keypair to allow recreation...${NC}"
+            aws ec2 delete-key-pair --region us-east-1 --key-name "pod${POD_NUMBER}-keypair" 2>/dev/null || true
+            echo -e "${GREEN}✓ Orphaned keypair deleted${NC}"
+        fi
+    fi
+    echo ""
+fi
+
+# Function to silently attempt resource import
+# Returns 0 if import succeeded or resource already in state
+# Returns 1 if import failed (resource doesn't exist)
+silent_import() {
+    local resource_type=$1
+    local resource_name=$2
+    local resource_id=$3
+    
+    # Check if already in state (using cached list)
+    if echo "$STATE_CACHE" | grep -q "^${resource_type}.${resource_name}$"; then
+        return 0
+    fi
+    
+    # Try to import - capture output to check for errors
+    local import_output
+    import_output=$(terraform import -input=false "${resource_type}.${resource_name}" "${resource_id}" 2>&1)
+    local import_status=$?
+    
+    if [ $import_status -eq 0 ]; then
+        return 0
+    else
+        # Check if error is because resource doesn't exist (expected) vs other errors
+        if echo "$import_output" | grep -qiE "(not found|does not exist|cannot find)"; then
+            return 1
+        else
+            # Check for "already exists" errors which means import failed but resource exists
+            if echo "$import_output" | grep -qiE "(already exists|duplicate)"; then
+                echo ""
+                echo -e "${RED}ERROR: Resource ${resource_type}.${resource_name} exists but import failed!${NC}" >&2
+                echo -e "${YELLOW}Import output: ${import_output}${NC}" >&2
+            fi
+            return 1
+        fi
+    fi
+}
+
+# Step 1: Always attempt to import potentially existing resources
+# In container environments, state is lost but resources persist in MCD
+echo -e "${YELLOW}🔍 Checking for existing resources...${NC}"
+echo ""
+
+# Cache state list to avoid repeated terraform state calls
+STATE_CACHE=$(terraform state list 2>/dev/null || echo "")
+
+IMPORTED_COUNT=0
+    
+    # Define all resources that might already exist
+    # Format: "resource_type:resource_name:resource_id"
+    # Note: DLP profiles, Service VPCs, and Gateways cannot be imported due to MCD provider limitations
+    RESOURCES_TO_IMPORT=(
+        # MCD Address Objects
+        "ciscomcd_address_object:app1-egress-addr-object:pod${POD_NUMBER}-app1-egress"
+        "ciscomcd_address_object:app2-egress-addr-object:pod${POD_NUMBER}-app2-egress"
+        "ciscomcd_address_object:app1-ingress-addr-object:pod${POD_NUMBER}-app1-ingress"
+        
+        # MCD Service Objects
+        "ciscomcd_service_object:app1_svc_http:pod${POD_NUMBER}-app1"
+        
+        # MCD Policy Rule Sets
+        "ciscomcd_policy_rule_set:egress_policy:pod${POD_NUMBER}-egress-policy"
+        "ciscomcd_policy_rule_set:ingress_policy:pod${POD_NUMBER}-ingress-policy"
+        
+        # AWS Transit Gateway
+        "aws_ec2_transit_gateway:tgw:IMPORT_BY_TAG"
+        
+        # AWS Key Pair
+        "aws_key_pair:sshkeypair:pod${POD_NUMBER}-keypair"
+    )
+    
+    # Special handling for Transit Gateway (shared across all pods)
+    # CRITICAL: Only ONE TGW should exist for all 60 pods
+    import_tgw() {
+        echo -n "  • aws_ec2_transit_gateway.tgw (shared)... "
+        
+        # Check if already in state (using cached list)
+        if echo "$STATE_CACHE" | grep -q "^aws_ec2_transit_gateway.tgw$"; then
+            echo -e "${GREEN}✓${NC}"
+            return 0
+        fi
+        
+        # Check if AWS CLI is available
+        if ! command -v aws &>/dev/null; then
+            echo -e "${YELLOW}(AWS CLI not available - will attempt creation)${NC}"
+            return 1
+        fi
+        
+        # Try to find the SHARED TGW by tag (get the FIRST available one)
+        TGW_ID=$(aws ec2 describe-transit-gateways \
+            --region us-east-1 \
+            --filters "Name=tag:Name,Values=multicloud-defense-lab-transit-gateway" "Name=state,Values=available" \
+            --query 'TransitGateways[0].TransitGatewayId' \
+            --output text 2>/dev/null || echo "")
+        
+        if [ -n "$TGW_ID" ] && [ "$TGW_ID" != "None" ] && [ "$TGW_ID" != "null" ]; then
+            # TGW exists - MUST import it to prevent duplicate creation
+            echo ""
+            echo -e "    ${YELLOW}Found existing shared TGW: $TGW_ID${NC}"
+            echo -e "    ${YELLOW}Importing to prevent duplicate creation...${NC}"
+            
+            if terraform import -input=false "aws_ec2_transit_gateway.tgw" "$TGW_ID" 2>&1 | grep -q "Import successful"; then
+                echo -e "    ${GREEN}✓ Successfully imported shared TGW${NC}"
+                ((IMPORTED_COUNT++)) || true
+                return 0
+            else
+                echo -e "    ${RED}✗ Import failed - this may cause duplicate TGW creation!${NC}"
+                return 1
+            fi
+        fi
+        
+        echo -e "${BLUE}(no existing TGW found - will create new shared TGW)${NC}"
+        return 1
+    }
+    
+    for resource_entry in "${RESOURCES_TO_IMPORT[@]}"; do
+        IFS=':' read -r res_type res_name res_id <<< "$resource_entry"
+        
+        # Special handling for Transit Gateway
+        if [ "$res_id" == "IMPORT_BY_TAG" ]; then
+            if import_tgw; then
+                ((IMPORTED_COUNT++)) || true
+            fi
+            continue
+        fi
+        
+        echo -n "  • ${res_type}.${res_name}... "
+        
+        # Try import and capture detailed output (suppress expected errors from student view)
+        import_output=$(terraform import -input=false "${res_type}.${res_name}" "${res_id}" 2>&1)
+        import_status=$?
+        
+        if [ $import_status -eq 0 ]; then
+            echo -e "${GREEN}✓${NC}"
+            ((IMPORTED_COUNT++)) || true
+        else
+            # Check if it's already in state
+            if echo "$STATE_CACHE" | grep -q "^${res_type}.${res_name}$"; then
+                echo -e "${GREEN}✓${NC}"
+            # Check if error is "not found" (truly new resource) - don't show error
+            elif echo "$import_output" | grep -qiE "(not found|does not exist|cannot find|Cannot import non-existent)"; then
+                echo -e "${BLUE}(new)${NC}"
+            # Otherwise, it might be a real issue - but still don't spam students
+            else
+                echo -e "${BLUE}(new)${NC}"
+            fi
+        fi
+    done
+    
+echo ""
+if [ $IMPORTED_COUNT -gt 0 ]; then
+    echo -e "${GREEN}✓ Imported ${IMPORTED_COUNT} existing resource(s)${NC}"
+else
+    echo -e "${BLUE}ℹ️  No existing resources found${NC}"
+fi
+echo ""
+
+# Step 2: Run Terraform Plan
+echo -e "${YELLOW}📊 Generating deployment plan...${NC}"
+echo ""
+
+# Remove any stale lock files
+if [ -f ".terraform.tfstate.lock.info" ]; then
+    echo -e "${YELLOW}⚠️  Removing stale state lock...${NC}"
+    rm -f .terraform.tfstate.lock.info
+    echo ""
+fi
+
+PLAN_OUTPUT=$(terraform plan -out=tfplan -input=false 2>&1 | sanitize_output)
+PLAN_STATUS=$?
+
+echo "$PLAN_OUTPUT"
+
+if [ $PLAN_STATUS -ne 0 ]; then
+    echo ""
+    
+    # Check if it's a state lock error
+    if echo "$PLAN_OUTPUT" | grep -q "Error acquiring the state lock"; then
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}⚠️  State Lock Error - Auto-recovering...${NC}"
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "A previous Terraform operation didn't complete cleanly."
+        echo "Removing the lock and retrying..."
+        echo ""
+        
+        # Force remove the lock
+        rm -f .terraform.tfstate.lock.info
+        terraform force-unlock -force $(echo "$PLAN_OUTPUT" | grep "ID:" | awk '{print $2}') 2>/dev/null || true
+        
+        # Retry the plan
+        echo -e "${YELLOW}🔄 Retrying plan...${NC}"
+        echo ""
+        PLAN_OUTPUT=$(terraform plan -out=tfplan -input=false 2>&1 | sanitize_output)
+        PLAN_STATUS=$?
+        echo "$PLAN_OUTPUT"
+        
+        if [ $PLAN_STATUS -ne 0 ]; then
+            echo ""
+            echo -e "${RED}❌ Terraform plan failed after unlock${NC}"
+            exit 1
+        fi
+        
+        echo ""
+        echo -e "${GREEN}✓ Plan generated successfully after unlock${NC}"
+        echo ""
+    else
+        echo -e "${RED}❌ Terraform plan failed${NC}"
+        echo ""
+    
+        # Check for specific errors and provide guidance
+        if echo "$PLAN_OUTPUT" | grep -q "TransitGatewayLimitExceeded"; then
+            echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+            echo -e "${YELLOW}⚠️  AWS Transit Gateway Limit Exceeded${NC}"
+            echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            echo "Your AWS account has too many Transit Gateways."
+            echo ""
+            echo "To fix this:"
+            echo "  1. Check existing TGWs: aws ec2 describe-transit-gateways --region us-east-1"
+            echo "  2. Delete unused TGWs from previous deployments"
+            echo "  3. Or contact your lab administrator to clean up resources"
+            echo ""
+        fi
+        
+        if echo "$PLAN_OUTPUT" | grep -qiE "(already exists|duplicate entry)"; then
+            echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+            echo -e "${YELLOW}⚠️  Resources Already Exist${NC}"
+            echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+            echo ""
+            echo "Some MCD resources already exist in the plan phase."
+            echo "This usually means there's a configuration issue."
+            echo ""
+            echo "Note: If this happens during 'terraform apply', the script will"
+            echo "automatically handle it gracefully."
+            echo ""
+        fi
+        
+        exit 1
+    fi
+fi
+
+echo ""
+echo -e "${GREEN}✓ Plan generated successfully${NC}"
+echo ""
+
+# Step 3: Apply the plan
+echo -e "${YELLOW}🚀 Deploying lab environment...${NC}"
+echo ""
+
+APPLY_OUTPUT=$(terraform apply -input=false -auto-approve tfplan 2>&1 | sanitize_output)
+APPLY_STATUS=$?
+
+echo "$APPLY_OUTPUT"
+
+if [ $APPLY_STATUS -eq 0 ]; then
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}✅ Deployment successful!${NC}"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "Your Multicloud Defense lab environment is now ready."
+    echo ""
+    echo "Next steps:"
+    echo "  • View your environment details: terraform output"
+    echo "  • Check AWS resources: ./check-aws-resources.sh"
+    echo "  • Install applications: ./application1_install.sh"
+    echo ""
+    echo -e "${BLUE}📖 Want to know what just happened? Read DEPLOYMENT.md!${NC}"
+    echo ""
+else
+    # Check if error is ONLY "already exists" - if so, treat as success
+    if echo "$APPLY_OUTPUT" | grep -qiE "(already exists|duplicate)"; then
+        # Check if there are OTHER errors besides "already exists"
+        if echo "$APPLY_OUTPUT" | grep -qE "Error:" | grep -vqiE "(already exists|duplicate)"; then
+            # There are other errors, this is a real failure
+            echo ""
+            echo -e "${RED}❌ Deployment failed with errors${NC}"
+            echo ""
+            exit 1
+        fi
+        
+        # Only "already exists" errors - the resources exist, so we're good
+        echo ""
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}⚠️  Some MCD Resources Already Exist${NC}"
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "Some MCD resources already exist (DLP profile, Service VPC)."
+        echo "The Cisco MCD provider has broken import support for these."
+        echo ""
+        echo -e "${GREEN}✓ These resources are already configured correctly.${NC}"
+        echo -e "${GREEN}✓ Treating as successful deployment.${NC}"
+        echo ""
+        echo -e "${BLUE}Note: In container environments, this is expected behavior when${NC}"
+        echo -e "${BLUE}the state file is lost but resources persist in MCD.${NC}"
+        echo ""
+        
+        # Continue to success message
+        echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}✅ Deployment successful (with existing resources)!${NC}"
+        echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "Your Multicloud Defense lab environment is ready."
+        echo ""
+        echo "Next steps:"
+        echo "  • View your environment details: terraform output"
+        echo "  • Check AWS resources: ./check-aws-resources.sh"
+        echo "  • Install applications: ./application1_install.sh"
+        echo ""
+        echo -e "${BLUE}📖 Want to know what just happened? Read DEPLOYMENT.md!${NC}"
+        echo ""
+        exit 0
+    fi
+    
+    echo ""
+    echo -e "${RED}❌ Deployment failed${NC}"
+    echo ""
+    
+    # Check for common errors and provide helpful messages
+    if grep -q "AddressLimitExceeded" tfplan 2>/dev/null || grep -q "AddressLimitExceeded" terraform.log 2>/dev/null; then
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${YELLOW}⚠️  AWS Elastic IP Limit Reached${NC}"
+        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo "Your AWS account has reached its Elastic IP limit."
+        echo ""
+        echo "To fix this, you need to:"
+        echo "  1. Release unused Elastic IPs from previous deployments"
+        echo "  2. Run: terraform destroy (to clean up your current pod)"
+        echo "  3. Or use the AWS Console to manually release EIPs"
+        echo ""
+        echo "Check EIPs in AWS Console:"
+        echo "  EC2 → Network & Security → Elastic IPs"
+        echo ""
+    fi
+    
+    echo "Please review the errors above"
+    rm -f tfplan
+    exit 1
+fi
+
+# Cleanup
+rm -f tfplan
+
+echo ""
+

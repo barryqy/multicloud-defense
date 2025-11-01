@@ -1,0 +1,35 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars.backup
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Temporary credential files (obfuscated)
+.mcd-*.json
+.aws-*.key
+mcd-key.json
+
+# SSH Keys
+*-private-key
+*-public-key
+*.pem
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+*.md
