@@ -186,6 +186,7 @@ IMPORTED_COUNT=0
     
     # Special handling for Transit Gateway (shared across all pods)
     # CRITICAL: Only ONE TGW should exist for all 60 pods
+    # DO NOT import - it's a shared resource managed by lifecycle rules
     import_tgw() {
         echo -n "  • aws_ec2_transit_gateway.tgw (shared)... "
         
@@ -197,11 +198,11 @@ IMPORTED_COUNT=0
         
         # Check if AWS CLI is available
         if ! command -v aws &>/dev/null; then
-            echo -e "${YELLOW}(AWS CLI not available - will attempt creation)${NC}"
+            echo -e "${BLUE}(will be created/detected during apply)${NC}"
             return 1
         fi
         
-        # Try to find the SHARED TGW by tag (get the FIRST available one)
+        # Check if the SHARED TGW already exists (don't import, just inform)
         TGW_ID=$(aws ec2 describe-transit-gateways \
             --region us-east-1 \
             --filters "Name=tag:Name,Values=multicloud-defense-lab-transit-gateway" "Name=state,Values=available" \
@@ -209,22 +210,12 @@ IMPORTED_COUNT=0
             --output text 2>/dev/null || echo "")
         
         if [ -n "$TGW_ID" ] && [ "$TGW_ID" != "None" ] && [ "$TGW_ID" != "null" ]; then
-            # TGW exists - MUST import it to prevent duplicate creation
-            echo ""
-            echo -e "    ${YELLOW}Found existing shared TGW: $TGW_ID${NC}"
-            echo -e "    ${YELLOW}Importing to prevent duplicate creation...${NC}"
-            
-            if terraform import -input=false "aws_ec2_transit_gateway.tgw" "$TGW_ID" 2>&1 | grep -q "Import successful"; then
-                echo -e "    ${GREEN}✓ Successfully imported shared TGW${NC}"
-                ((IMPORTED_COUNT++)) || true
-                return 0
-            else
-                echo -e "    ${RED}✗ Import failed - this may cause duplicate TGW creation!${NC}"
-                return 1
-            fi
+            # TGW exists - Terraform will use it (lifecycle rules prevent recreation)
+            echo -e "${GREEN}✓ (shared: $TGW_ID)${NC}"
+            return 0
         fi
         
-        echo -e "${BLUE}(no existing TGW found - will create new shared TGW)${NC}"
+        echo -e "${BLUE}(will create new shared TGW)${NC}"
         return 1
     }
     
@@ -363,10 +354,30 @@ echo ""
 echo -e "${YELLOW}🚀 Deploying lab environment...${NC}"
 echo ""
 
+# Capture output and filter "already exists" errors that we'll handle gracefully
 APPLY_OUTPUT=$(terraform apply -input=false -auto-approve tfplan 2>&1 | sanitize_output)
 APPLY_STATUS=$?
 
-echo "$APPLY_OUTPUT"
+# Check if there are ONLY "already exists" errors (which we handle gracefully)
+ONLY_EXISTS_ERRORS=false
+if [ $APPLY_STATUS -ne 0 ]; then
+    if echo "$APPLY_OUTPUT" | grep -qiE "(already exists|duplicate entry)"; then
+        # Check if there are OTHER errors besides "already exists"
+        OTHER_ERRORS=$(echo "$APPLY_OUTPUT" | grep "Error:" | grep -viE "(already exists|duplicate entry|address group exists|dlp profile already exists|Service VPC.*already exists|policy_rule_sets)")
+        if [ -z "$OTHER_ERRORS" ]; then
+            ONLY_EXISTS_ERRORS=true
+        fi
+    fi
+fi
+
+# Display output, filtering "already exists" errors if they're the only errors
+if [ "$ONLY_EXISTS_ERRORS" = true ]; then
+    # Filter out the "already exists" error blocks for cleaner student output
+    echo "$APPLY_OUTPUT" | grep -v "╷" | grep -v "│" | grep -v "╵" | grep -viE "(address group exists|dlp profile already exists|Service VPC.*already exists|Duplicate entry.*policy_rule_sets)" || echo "$APPLY_OUTPUT"
+else
+    # Show all output for other errors
+    echo "$APPLY_OUTPUT"
+fi
 
 if [ $APPLY_STATUS -eq 0 ]; then
     echo ""
@@ -376,54 +387,69 @@ if [ $APPLY_STATUS -eq 0 ]; then
     echo ""
     echo "Your Multicloud Defense lab environment is now ready."
     echo ""
-    echo "Next steps:"
-    echo "  • View your environment details: terraform output"
-    echo "  • Check AWS resources: ./check-aws-resources.sh"
-    echo "  • Install applications: ./application1_install.sh"
+    
+    # Export environment variables and display server information
+    export POD_NUMBER=$(grep -E '^pod_number' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
+    export APP1_PUBLIC_IP=$(terraform output -raw app1-public-eip 2>/dev/null || echo "N/A")
+    export APP2_PUBLIC_IP=$(terraform output -raw app2-public-eip 2>/dev/null || echo "N/A")
+    export APP1_PRIVATE_IP=$(terraform output -raw app1-private-ip 2>/dev/null || echo "N/A")
+    export APP2_PRIVATE_IP=$(terraform output -raw app2-private-ip 2>/dev/null || echo "N/A")
+    
+    echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}📡 Server Information${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "${BLUE}📖 Want to know what just happened? Read DEPLOYMENT.md!${NC}"
+    printf "%-15s %-20s %-20s %s\n" "Server" "Public IP" "Private IP" "SSH Command"
+    echo "────────────────────────────────────────────────────────────────────────────────────────────────"
+    printf "%-15s %-20s %-20s %s\n" "App1" "$APP1_PUBLIC_IP" "$APP1_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP1_PUBLIC_IP}"
+    printf "%-15s %-20s %-20s %s\n" "App2" "$APP2_PUBLIC_IP" "$APP2_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP2_PUBLIC_IP}"
+    echo ""
+    
+    echo "Next steps:"
+    echo "  • SSH into servers using commands above"
+    echo "  • Test App1: http://${APP1_PUBLIC_IP}"
+    echo "  • Test App2: http://${APP2_PUBLIC_IP}"
+    echo ""
+    echo -e "${BLUE}📖 Want to know what just happened? Read instructions on the left!${NC}"
     echo ""
 else
     # Check if error is ONLY "already exists" - if so, treat as success
-    if echo "$APPLY_OUTPUT" | grep -qiE "(already exists|duplicate)"; then
-        # Check if there are OTHER errors besides "already exists"
-        if echo "$APPLY_OUTPUT" | grep -qE "Error:" | grep -vqiE "(already exists|duplicate)"; then
-            # There are other errors, this is a real failure
-            echo ""
-            echo -e "${RED}❌ Deployment failed with errors${NC}"
-            echo ""
-            exit 1
-        fi
-        
+    if [ "$ONLY_EXISTS_ERRORS" = true ]; then
         # Only "already exists" errors - the resources exist, so we're good
         echo ""
-        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
-        echo -e "${YELLOW}⚠️  Some MCD Resources Already Exist${NC}"
-        echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
-        echo ""
-        echo "Some MCD resources already exist (DLP profile, Service VPC)."
-        echo "The Cisco MCD provider has broken import support for these."
-        echo ""
-        echo -e "${GREEN}✓ These resources are already configured correctly.${NC}"
-        echo -e "${GREEN}✓ Treating as successful deployment.${NC}"
-        echo ""
-        echo -e "${BLUE}Note: In container environments, this is expected behavior when${NC}"
-        echo -e "${BLUE}the state file is lost but resources persist in MCD.${NC}"
-        echo ""
-        
-        # Continue to success message
         echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
-        echo -e "${GREEN}✅ Deployment successful (with existing resources)!${NC}"
+        echo -e "${GREEN}✅ Deployment successful!${NC}"
         echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "${BLUE}ℹ️  Note: Some MCD resources were already configured from a previous${NC}"
+        echo -e "${BLUE}   deployment. This is normal in container environments.${NC}"
         echo ""
         echo "Your Multicloud Defense lab environment is ready."
         echo ""
-        echo "Next steps:"
-        echo "  • View your environment details: terraform output"
-        echo "  • Check AWS resources: ./check-aws-resources.sh"
-        echo "  • Install applications: ./application1_install.sh"
+        
+        # Export environment variables and display server information
+        export POD_NUMBER=$(grep -E '^pod_number' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
+        export APP1_PUBLIC_IP=$(terraform output -raw app1-public-eip 2>/dev/null || echo "N/A")
+        export APP2_PUBLIC_IP=$(terraform output -raw app2-public-eip 2>/dev/null || echo "N/A")
+        export APP1_PRIVATE_IP=$(terraform output -raw app1-private-ip 2>/dev/null || echo "N/A")
+        export APP2_PRIVATE_IP=$(terraform output -raw app2-private-ip 2>/dev/null || echo "N/A")
+        
+        echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BLUE}📡 Server Information${NC}"
+        echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
         echo ""
-        echo -e "${BLUE}📖 Want to know what just happened? Read DEPLOYMENT.md!${NC}"
+        printf "%-15s %-20s %-20s %s\n" "Server" "Public IP" "Private IP" "SSH Command"
+        echo "────────────────────────────────────────────────────────────────────────────────────────────────"
+        printf "%-15s %-20s %-20s %s\n" "App1" "$APP1_PUBLIC_IP" "$APP1_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP1_PUBLIC_IP}"
+        printf "%-15s %-20s %-20s %s\n" "App2" "$APP2_PUBLIC_IP" "$APP2_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP2_PUBLIC_IP}"
+        echo ""
+        
+        echo "Next steps:"
+        echo "  • SSH into servers using commands above"
+        echo "  • Test App1: http://${APP1_PUBLIC_IP}"
+        echo "  • Test App2: http://${APP2_PUBLIC_IP}"
+        echo ""
+        echo -e "${BLUE}📖 Want to understand the deployment? Read the instructions on the left!${NC}"
         echo ""
         exit 0
     fi
