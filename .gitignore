@@ -10,6 +10,7 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+tgw-attachments.tf
 
 # Temporary credential files (obfuscated)
 .mcd-*.json
@@ -20,6 +21,11 @@ mcd-key.json
 *-private-key
 *-public-key
 *.pem
+
+# Logs
+logs/
+*.log
+nohup.out
 
 # OS Files
 .DS_Store
@@ -32,4 +38,19 @@ Thumbs.db
 *.swo
 *~
 
+# AWS CLI Installation Files
+aws/
+awscliv2.zip
+AWSCLIV2.pkg
+~/bin/aws
+~/aws-cli/
+
+# Reference files
+reference/
+
+# Markdown files - exclude all
 *.md
+cleanup/*.md
+*.backup
+# But allow ONLY the root README.md
+!/README.md

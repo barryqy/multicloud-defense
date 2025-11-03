@@ -22,15 +22,23 @@ resource "ciscomcd_address_object" "app2-egress-addr-object" {
 
 resource "ciscomcd_address_object" "app1-ingress-addr-object" {
   name            = "pod${var.pod_number}-app1-ingress"
-  description     = "Address Object"
+  description     = "Address Object for App1"
   type            = "STATIC"
   value           = ["10.${var.pod_number}.100.10"]
   backend_address = true
 }
 
+resource "ciscomcd_address_object" "app2-ingress-addr-object" {
+  name            = "pod${var.pod_number}-app2-ingress"
+  description     = "Address Object for App2"
+  type            = "STATIC"
+  value           = ["10.${100 + var.pod_number}.100.10"]
+  backend_address = true
+}
+
 resource "ciscomcd_service_object" "app1_svc_http" {
   name           = "pod${var.pod_number}-app1"
-  description    = "App1 Service Object"
+  description    = "App1 Service Object - Port 80"
   service_type   = "ReverseProxy"
   protocol       = "TCP"
   transport_mode = "HTTP"
@@ -40,6 +48,20 @@ resource "ciscomcd_service_object" "app1_svc_http" {
     backend_ports     = "80"
   }
   backend_address_group = ciscomcd_address_object.app1-ingress-addr-object.id
+}
+
+resource "ciscomcd_service_object" "app2_svc_http" {
+  name           = "pod${var.pod_number}-app2"
+  description    = "App2 Service Object - Port 8080"
+  service_type   = "ReverseProxy"
+  protocol       = "TCP"
+  transport_mode = "HTTP"
+  source_nat     = false
+  port {
+    destination_ports = "8080"
+    backend_ports     = "80"  # App2 listens on port 80, but ingress is on 8080
+  }
+  backend_address_group = ciscomcd_address_object.app2-ingress-addr-object.id
 }
 
 resource "ciscomcd_profile_dlp" "block-ssn-dlp" {
@@ -59,7 +81,13 @@ resource "ciscomcd_service_vpc" "svpc-aws" {
   cidr               = "192.168.${var.pod_number}.0/24"
   availability_zones = ["us-east-1a"]
   use_nat_gateway    = false
-  transit_gateway_id = aws_ec2_transit_gateway.tgw.id
+  transit_gateway_id = data.aws_ec2_transit_gateway.tgw.id
+  
+  # CRITICAL: Protect shared TGW from accidental modifications
+  # The TGW is shared across all 50 pods and must never be changed
+  lifecycle {
+    ignore_changes = [transit_gateway_id]
+  }
 }
 
 resource "ciscomcd_policy_rule_set" "egress_policy" {
@@ -69,7 +97,8 @@ resource "ciscomcd_policy_rule_set" "egress_policy" {
 resource "ciscomcd_policy_rules" "egress-ew-policy-rules" {
   rule_set_id = ciscomcd_policy_rule_set.egress_policy.id
   rule {
-    name                      = "rule1"
+    name                      = "egress-internet-with-dlp"
+    description               = "Egress to internet with IPS and DLP inspection"
     action                    = "Allow Log"
     state                     = "ENABLED"
     service                   = data.ciscomcd_service_object.sample-egress-forward-snat-tcp.id
@@ -80,7 +109,20 @@ resource "ciscomcd_policy_rules" "egress-ew-policy-rules" {
     dlp_profile               = ciscomcd_profile_dlp.block-ssn-dlp.id
   }
   rule {
-    name        = "rule2"
+    name                      = "egress-app2-internet-with-dlp"
+    description               = "App2 egress to internet with IPS and DLP inspection"
+    action                    = "Allow Log"
+    state                     = "ENABLED"
+    service                   = data.ciscomcd_service_object.sample-egress-forward-snat-tcp.id
+    source                    = ciscomcd_address_object.app2-egress-addr-object.id
+    destination               = data.ciscomcd_address_object.internet_addr_obj.id
+    type                      = "Forwarding"
+    network_intrusion_profile = data.ciscomcd_profile_network_intrusion.ciscomcd-sample-ips-balanced-alert.id
+    dlp_profile               = ciscomcd_profile_dlp.block-ssn-dlp.id
+  }
+  rule {
+    name        = "east-west-app1-app2"
+    description = "Allow traffic between App1 and App2"
     action      = "Allow Log"
     state       = "ENABLED"
     service     = data.ciscomcd_service_object.sample-egress-forward-tcp.id
@@ -97,11 +139,21 @@ resource "ciscomcd_policy_rule_set" "ingress_policy" {
 resource "ciscomcd_policy_rules" "ingress-policy-rules" {
   rule_set_id = ciscomcd_policy_rule_set.ingress_policy.id
   rule {
-    name                      = "rule1"
-    description               = "Ingress rule1"
+    name                      = "app1-http"
+    description               = "App1 HTTP on port 80"
     type                      = "ReverseProxy"
     action                    = "Allow Log"
     service                   = ciscomcd_service_object.app1_svc_http.id
+    source                    = data.ciscomcd_address_object.any_addr_obj.id
+    network_intrusion_profile = data.ciscomcd_profile_network_intrusion.ciscomcd-sample-ips-balanced-alert.id
+    state                     = "ENABLED"
+  }
+  rule {
+    name                      = "app2-http"
+    description               = "App2 HTTP on port 8080"
+    type                      = "ReverseProxy"
+    action                    = "Allow Log"
+    service                   = ciscomcd_service_object.app2_svc_http.id
     source                    = data.ciscomcd_address_object.any_addr_obj.id
     network_intrusion_profile = data.ciscomcd_profile_network_intrusion.ciscomcd-sample-ips-balanced-alert.id
     state                     = "ENABLED"

@@ -52,7 +52,7 @@ echo ""
 echo -e "${YELLOW}Resources to be destroyed:${NC}"
 echo "  AWS Resources:"
 echo "    • VPCs and all networking (subnets, route tables)"
-echo "    • EC2 Instances (app1, app2)"
+echo "    • EC2 Instances (app1, app2, jumpbox)"
 echo "    • Elastic IPs"
 echo "    • Security Groups"
 echo "    • Internet Gateways"
@@ -93,13 +93,10 @@ echo -e "${BLUE}Step 1: Running terraform destroy...${NC}"
 echo ""
 
 if [ -f "main.tf" ] && [ -d ".terraform" ]; then
-    # Remove shared TGW from state before destroying (it's shared across all pods)
-    echo -e "${YELLOW}  Removing shared Transit Gateway from state...${NC}"
-    if terraform state rm aws_ec2_transit_gateway.tgw 2>&1 | sanitize_output; then
-        echo -e "${GREEN}  ✓ Transit Gateway removed from state (shared resource)${NC}"
-    else
-        echo -e "${YELLOW}  ℹ️  Transit Gateway not in state (already removed)${NC}"
-    fi
+    # NOTE: TGW is now a DATA SOURCE (not a resource), so it's never in state
+    # No need to remove it before destroy
+    echo -e "${BLUE}  Transit Gateway is a data source (tgw-0a878e2f5870e2ccf)${NC}"
+    echo -e "${BLUE}  It's never in state and never gets destroyed${NC}"
     echo ""
     
     if terraform destroy -auto-approve 2>&1 | sanitize_output; then

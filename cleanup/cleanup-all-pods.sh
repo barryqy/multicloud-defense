@@ -2,7 +2,7 @@
 
 # ALL PODS CLEANUP SCRIPT
 # ⚠️ INSTRUCTOR/ADMIN USE ONLY ⚠️
-# This script cleans up ALL student pods (1-60)
+# This script cleans up ALL student pods (1-50)
 # Requires password authentication
 
 set -e
@@ -24,7 +24,7 @@ echo "╔═══════════════════════�
 echo "║     ⚠️  ALL PODS CLEANUP - ADMIN ONLY  ⚠️             ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
-echo -e "${RED}WARNING: This will destroy resources for ALL pods (1-60)${NC}"
+echo -e "${RED}WARNING: This will destroy resources for ALL pods (1-50)${NC}"
 echo -e "${RED}This operation cannot be undone!${NC}"
 echo ""
 
@@ -49,7 +49,7 @@ export LAB_PASSWORD="$INPUT_PASSWORD"
 
 # Double confirmation
 echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}You are about to clean up ALL 60 pods:${NC}"
+echo -e "${YELLOW}You are about to clean up ALL 50 pods:${NC}"
 echo "  • All AWS VPCs, EC2 instances, networking"
 echo "  • All MCD gateways, policies, address objects"
 echo "  • All student SSH keys and state files"
@@ -211,7 +211,7 @@ cleanup_pod() {
 }
 
 # Main cleanup loop
-TOTAL_PODS=60
+TOTAL_PODS=50
 CLEANED=0
 
 echo -e "${MAGENTA}Starting cleanup of ${TOTAL_PODS} pods...${NC}"
