@@ -46,12 +46,90 @@ resource "aws_subnet" "app_subnet" {
   }
 }
 
+#################################################################################################################################
+# Management VPC for Jumpbox (separate from app VPCs)
+#################################################################################################################################
+
+resource "aws_vpc" "mgmt_vpc" {
+  # Management VPC CIDR: 172.16.{pod}.0/24 (avoids conflict with 10.x.x.x used by apps)
+  # Max pod number: 60, so 172.16.60.0/24 is the highest
+  cidr_block           = "172.16.${var.pod_number}.0/24"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  instance_tenancy     = "default"
+  tags = {
+    Name = "pod${var.pod_number}-mgmt-vpc"
+  }
+}
+
 resource "aws_subnet" "mgmt_subnet" {
-  vpc_id            = aws_vpc.app_vpc[0].id
-  cidr_block        = "10.${var.pod_number}.200.0/24"
+  vpc_id            = aws_vpc.mgmt_vpc.id
+  cidr_block        = "172.16.${var.pod_number}.0/28"  # /28 gives 16 IPs (enough for jumpbox)
   availability_zone = "us-east-1a"
   tags = {
     Name = "pod${var.pod_number}-mgmt-subnet"
+  }
+}
+
+resource "aws_internet_gateway" "mgmt_igw" {
+  vpc_id = aws_vpc.mgmt_vpc.id
+  tags = {
+    Name = "pod${var.pod_number}-mgmt-igw"
+  }
+}
+
+resource "aws_route_table" "mgmt_rt" {
+  vpc_id = aws_vpc.mgmt_vpc.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.mgmt_igw.id
+  }
+  tags = {
+    Name = "pod${var.pod_number}-mgmt-rt"
+  }
+}
+
+# Route for Management VPC to reach App VPCs via TGW
+# This route is only created after TGW attachments exist (from 5-attach-tgw.sh)
+resource "aws_route" "mgmt_to_tgw" {
+  count                  = fileexists("${path.module}/tgw-attachments.tf") ? 1 : 0
+  route_table_id         = aws_route_table.mgmt_rt.id
+  destination_cidr_block = "10.0.0.0/8"
+  transit_gateway_id     = data.aws_ec2_transit_gateway.tgw.id
+  
+  # Depend on TGW attachments (created by 5-attach-tgw.sh)
+  depends_on = [
+    aws_ec2_transit_gateway_vpc_attachment.app1_attachment,
+    aws_ec2_transit_gateway_vpc_attachment.app2_attachment
+  ]
+}
+
+resource "aws_route_table_association" "mgmt_rt_assoc" {
+  subnet_id      = aws_subnet.mgmt_subnet.id
+  route_table_id = aws_route_table.mgmt_rt.id
+}
+
+resource "aws_security_group" "jumpbox_sg" {
+  name        = "pod${var.pod_number}-jumpbox-sg"
+  description = "Security group for jumpbox"
+  vpc_id      = aws_vpc.mgmt_vpc.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "pod${var.pod_number}-jumpbox-sg"
   }
 }
 
@@ -101,12 +179,17 @@ resource "aws_instance" "AppMachines" {
   depends_on = [
     aws_network_interface_sg_attachment.app-sg,
     aws_eip_association.app-eip-assocation,
-    aws_internet_gateway.int_gw,
-    aws_route.ext_default_route
+    aws_internet_gateway.int_gw
   ]
 
+  # IMPORTANT: Provisioners may fail when TGW routing is enabled (traffic goes through MCD)
+  # Using on_failure = continue ensures instances are created even if SSH provisioning fails
+  # Files can be deployed manually via user_data or through jumpbox after TGW attachment
+  
   # Wait for instance to be ready and SSH available
   provisioner "remote-exec" {
+    on_failure = continue
+    
     inline = [
       "echo 'Waiting for cloud-init to complete...'",
       "cloud-init status --wait",
@@ -118,11 +201,13 @@ resource "aws_instance" "AppMachines" {
       user        = "ubuntu"
       private_key = tls_private_key.key_pair.private_key_openssh
       host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "10m"
+      timeout     = "5m"
     }
   }
 
   provisioner "file" {
+    on_failure = continue
+    
     source      = "./images/aws-app${count.index + 1}.png"
     destination = "/home/ubuntu/aws-app.png"
 
@@ -131,11 +216,13 @@ resource "aws_instance" "AppMachines" {
       user        = "ubuntu"
       private_key = tls_private_key.key_pair.private_key_openssh
       host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "10m"
+      timeout     = "5m"
     }
   }
 
   provisioner "file" {
+    on_failure = continue
+    
     source      = "./html/index.html"
     destination = "/home/ubuntu/index.html"
 
@@ -144,11 +231,13 @@ resource "aws_instance" "AppMachines" {
       user        = "ubuntu"
       private_key = tls_private_key.key_pair.private_key_openssh
       host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "10m"
+      timeout     = "5m"
     }
   }
 
   provisioner "file" {
+    on_failure = continue
+    
     source      = "./html/status${count.index + 1}"
     destination = "/home/ubuntu/status"
 
@@ -157,7 +246,7 @@ resource "aws_instance" "AppMachines" {
       user        = "ubuntu"
       private_key = tls_private_key.key_pair.private_key_openssh
       host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "10m"
+      timeout     = "5m"
     }
   }
 
@@ -175,6 +264,67 @@ resource "aws_network_interface" "application_interface" {
   private_ips = count.index == 0 ? local.app1_nic : local.app2_nic
   tags = {
     Name = "pod${var.pod_number}-app${count.index + 1}-nic"
+  }
+}
+
+#################################################################################################################################
+# Jumpbox Instance
+#################################################################################################################################
+
+resource "aws_instance" "jumpbox" {
+  ami                         = "ami-0e2c8caa4b6378d8c"
+  instance_type               = "t2.micro"
+  subnet_id                   = aws_subnet.mgmt_subnet.id
+  vpc_security_group_ids      = [aws_security_group.jumpbox_sg.id]
+  associate_public_ip_address = true
+  key_name                    = aws_key_pair.sshkeypair.key_name
+
+  # Ensure keypair and networking are ready
+  depends_on = [
+    aws_internet_gateway.mgmt_igw,
+    aws_route_table_association.mgmt_rt_assoc,
+    local_file.private_key
+  ]
+
+  # IMPORTANT: Provisioners may fail in container environments
+  # Using on_failure = continue ensures jumpbox is created even if file copy fails
+  # SSH key can be copied manually if needed
+  
+  provisioner "file" {
+    on_failure = continue
+    
+    source      = "pod${var.pod_number}-private-key"
+    destination = "/home/ubuntu/.ssh/id_rsa"
+    
+    connection {
+      type        = "ssh"
+      user        = "ubuntu"
+      private_key = tls_private_key.key_pair.private_key_openssh
+      host        = self.public_ip
+      timeout     = "5m"
+    }
+  }
+
+  provisioner "remote-exec" {
+    on_failure = continue
+    
+    inline = [
+      "chmod 600 /home/ubuntu/.ssh/id_rsa",
+      "echo '${local.app1_nic[0]} app1' | sudo tee -a /etc/hosts",
+      "echo '${local.app2_nic[0]} app2' | sudo tee -a /etc/hosts"
+    ]
+    
+    connection {
+      type        = "ssh"
+      user        = "ubuntu"
+      private_key = tls_private_key.key_pair.private_key_openssh
+      host        = self.public_ip
+      timeout     = "5m"
+    }
+  }
+
+  tags = {
+    Name = "pod${var.pod_number}-jumpbox"
   }
 }
 
@@ -258,12 +408,8 @@ resource "aws_route_table" "app-route" {
   }
 }
 
-resource "aws_route" "ext_default_route" {
-  count                  = 2
-  route_table_id         = aws_route_table.app-route["${count.index}"].id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.int_gw["${count.index}"].id
-}
+# Default routes are now defined in routes-config.tf
+# This allows attach-tgw.sh to toggle between IGW and TGW routing
 
 resource "aws_route" "jumpbox1_route" {
   count                  = 2
@@ -329,3 +475,28 @@ output "http_command_app2" {
   description = "HTTP URL for Application 2"
 }
 
+output "jumpbox_public_ip" {
+  value       = aws_instance.jumpbox.public_ip
+  description = "Public IP address of Jumpbox"
+}
+
+output "Command_to_use_for_ssh_into_jumpbox" {
+  value       = "ssh -i pod${var.pod_number}-private-key ubuntu@${aws_instance.jumpbox.public_ip}"
+  description = "SSH command to connect to Jumpbox"
+}
+
+# Instance IDs (for readiness checks)
+output "app1-instance-id" {
+  value       = aws_instance.AppMachines[0].id
+  description = "Instance ID of Application 1"
+}
+
+output "app2-instance-id" {
+  value       = aws_instance.AppMachines[1].id
+  description = "Instance ID of Application 2"
+}
+
+output "jumpbox_instance_id" {
+  value       = aws_instance.jumpbox.id
+  description = "Instance ID of Jumpbox"
+}

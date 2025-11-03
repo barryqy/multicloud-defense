@@ -68,10 +68,12 @@ REGION="us-east-1"
 # Function to delete resources
 delete_instances() {
     echo "🗑️  Terminating EC2 instances..."
+    
+    # Find app instances, jumpbox, AND MCD gateway instances
     INSTANCES=$(aws ec2 describe-instances \
         --region $REGION \
-        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1,pod${POD_NUMBER}-app2" \
-                  "Name=instance-state-name,Values=running,stopped" \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1,pod${POD_NUMBER}-app2,pod${POD_NUMBER}-jumpbox,*pod${POD_NUMBER}*gw*" \
+                  "Name=instance-state-name,Values=running,stopped,stopping" \
         --query 'Reservations[].Instances[].InstanceId' \
         --output text 2>/dev/null || true)
     
@@ -81,7 +83,7 @@ delete_instances() {
             aws ec2 terminate-instances --region $REGION --instance-ids $INSTANCE 2>/dev/null || true
         done
         echo "   Waiting for instances to terminate..."
-        sleep 30
+        sleep 45  # Increased wait time for gateway instances
     else
         echo "   No instances found"
     fi
@@ -97,7 +99,7 @@ delete_eips() {
     echo "📌 Releasing Elastic IPs..."
     EIPS=$(aws ec2 describe-addresses \
         --region $REGION \
-        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-eip,pod${POD_NUMBER}-app2-eip" \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-eip,pod${POD_NUMBER}-app2-eip,pod${POD_NUMBER}-jumpbox-eip,pod${POD_NUMBER}-ingress-gateway-eip" \
         --query 'Addresses[].AllocationId' \
         --output text 2>/dev/null || true)
     
@@ -115,7 +117,7 @@ delete_nat_gateways() {
     echo "🌐 Deleting NAT Gateways..."
     VPCS=$(aws ec2 describe-vpcs \
         --region $REGION \
-        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-vpc,pod${POD_NUMBER}-app2-vpc" \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-vpc,pod${POD_NUMBER}-app2-vpc,pod${POD_NUMBER}-svpc-aws" \
         --query 'Vpcs[].VpcId' \
         --output text 2>/dev/null || true)
     
@@ -131,6 +133,244 @@ delete_nat_gateways() {
             aws ec2 delete-nat-gateway --region $REGION --nat-gateway-id $NAT 2>/dev/null || true
         done
     done
+}
+
+delete_vpc_endpoints() {
+    echo "🔌 Deleting VPC Endpoints..."
+    
+    # Get all VPCs for this pod
+    VPCS=$(aws ec2 describe-vpcs \
+        --region $REGION \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
+        --query 'Vpcs[].VpcId' \
+        --output text 2>/dev/null || true)
+    
+    if [ -n "$VPCS" ]; then
+        for VPC in $VPCS; do
+            VPC_ENDPOINTS=$(aws ec2 describe-vpc-endpoints \
+                --region $REGION \
+                --filters "Name=vpc-id,Values=$VPC" \
+                --query 'VpcEndpoints[].VpcEndpointId' \
+                --output text 2>/dev/null || true)
+            
+            if [ -n "$VPC_ENDPOINTS" ]; then
+                for VPCE_ID in $VPC_ENDPOINTS; do
+                    VPCE_SERVICE=$(aws ec2 describe-vpc-endpoints \
+                        --region $REGION \
+                        --vpc-endpoint-ids $VPCE_ID \
+                        --query 'VpcEndpoints[0].ServiceName' \
+                        --output text 2>/dev/null || echo "unknown")
+                    
+                    echo "   Deleting VPC Endpoint: $VPCE_ID ($VPCE_SERVICE)"
+                    aws ec2 delete-vpc-endpoints \
+                        --region $REGION \
+                        --vpc-endpoint-ids $VPCE_ID 2>/dev/null || \
+                        echo "     Failed to delete $VPCE_ID"
+                done
+                
+                # Wait for endpoints to be deleted
+                echo "   Waiting for VPC endpoints to delete..."
+                sleep 15
+            fi
+        done
+    else
+        echo "   No VPCs found for pod${POD_NUMBER}"
+    fi
+}
+
+delete_vpc_endpoint_services() {
+    echo "🔌 Deleting VPC Endpoint Service Configurations (for Gateway LBs)..."
+    
+    # Find VPC Endpoint Services that contain pod number in their associated Gateway LB
+    VPCE_SERVICES=$(aws ec2 describe-vpc-endpoint-service-configurations \
+        --region $REGION \
+        --query "ServiceConfigurations[?GatewayLoadBalancerArns && contains(to_string(GatewayLoadBalancerArns), 'pod${POD_NUMBER}')].ServiceId" \
+        --output text 2>/dev/null || true)
+    
+    if [ -n "$VPCE_SERVICES" ]; then
+        echo "   Found $(echo $VPCE_SERVICES | wc -w | tr -d ' ') VPC Endpoint Service(s)"
+        for VPCE_SVC_ID in $VPCE_SERVICES; do
+            VPCE_SVC_NAME=$(aws ec2 describe-vpc-endpoint-service-configurations \
+                --region $REGION \
+                --service-ids $VPCE_SVC_ID \
+                --query 'ServiceConfigurations[0].ServiceName' \
+                --output text 2>/dev/null || echo "unknown")
+            
+            echo "   Deleting VPC Endpoint Service: $VPCE_SVC_ID"
+            echo "      Service Name: $VPCE_SVC_NAME"
+            aws ec2 delete-vpc-endpoint-service-configurations \
+                --region $REGION \
+                --service-ids $VPCE_SVC_ID 2>/dev/null && \
+                echo "      ✓ Deleted" || \
+                echo "      Failed to delete $VPCE_SVC_ID"
+        done
+        
+        # Wait for VPC Endpoint Services to be deleted
+        echo "   Waiting for VPC Endpoint Services to delete..."
+        sleep 15
+    else
+        echo "   No VPC Endpoint Services found for pod${POD_NUMBER}"
+    fi
+}
+
+delete_load_balancers() {
+    echo "⚖️  Deleting Load Balancers (MCD Gateways)..."
+    
+    # Method 1: Find by name pattern (if it contains pod number)
+    LBS_BY_NAME=$(aws elbv2 describe-load-balancers \
+        --region $REGION \
+        --query "LoadBalancers[?contains(LoadBalancerName, 'pod${POD_NUMBER}')].LoadBalancerArn" \
+        --output text 2>/dev/null || true)
+    
+    # Method 2: Find by VPC ID (more reliable for MCD-created LBs)
+    # Get all VPCs for this pod
+    VPCS=$(aws ec2 describe-vpcs \
+        --region $REGION \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-vpc,pod${POD_NUMBER}-app2-vpc,pod${POD_NUMBER}-svpc-aws,pod${POD_NUMBER}-mgmt-vpc" \
+        --query 'Vpcs[].VpcId' \
+        --output text 2>/dev/null || true)
+    
+    LBS_BY_VPC=""
+    for VPC in $VPCS; do
+        VPC_LBS=$(aws elbv2 describe-load-balancers \
+            --region $REGION \
+            --query "LoadBalancers[?VpcId=='$VPC'].LoadBalancerArn" \
+            --output text 2>/dev/null || true)
+        LBS_BY_VPC="$LBS_BY_VPC $VPC_LBS"
+    done
+    
+    # Combine and deduplicate
+    ALL_LBS=$(echo "$LBS_BY_NAME $LBS_BY_VPC" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
+    
+    if [ -n "$ALL_LBS" ]; then
+        LB_COUNT=$(echo "$ALL_LBS" | wc -l | tr -d ' ')
+        echo "   Found $LB_COUNT load balancer(s)"
+        
+        # Separate Gateway LBs from others (Gateway LBs need VPC Endpoint Service deletion first)
+        GATEWAY_LBS=""
+        OTHER_LBS=""
+        
+        for LB_ARN in $ALL_LBS; do
+            LB_TYPE=$(aws elbv2 describe-load-balancers \
+                --region $REGION \
+                --load-balancer-arns $LB_ARN \
+                --query 'LoadBalancers[0].Type' \
+                --output text 2>/dev/null || echo "unknown")
+            
+            if [ "$LB_TYPE" = "gateway" ]; then
+                GATEWAY_LBS="$GATEWAY_LBS $LB_ARN"
+            else
+                OTHER_LBS="$OTHER_LBS $LB_ARN"
+            fi
+        done
+        
+        # Delete non-gateway load balancers first (Network, Application LBs)
+        if [ -n "$OTHER_LBS" ]; then
+            echo ""
+            echo "   Deleting Network/Application Load Balancers first..."
+            for LB_ARN in $OTHER_LBS; do
+                LB_NAME=$(aws elbv2 describe-load-balancers \
+                    --region $REGION \
+                    --load-balancer-arns $LB_ARN \
+                    --query 'LoadBalancers[0].LoadBalancerName' \
+                    --output text 2>/dev/null || echo "unknown")
+                
+                LB_TYPE=$(aws elbv2 describe-load-balancers \
+                    --region $REGION \
+                    --load-balancer-arns $LB_ARN \
+                    --query 'LoadBalancers[0].Type' \
+                    --output text 2>/dev/null || echo "unknown")
+                
+                echo "      Deleting: $LB_NAME (Type: $LB_TYPE)"
+                aws elbv2 delete-load-balancer \
+                    --region $REGION \
+                    --load-balancer-arn $LB_ARN 2>/dev/null && \
+                    echo "      ✓ Deleted" || \
+                    echo "      Failed to delete $LB_NAME"
+            done
+            echo "      Waiting 30 seconds for Network/Application LBs to delete..."
+            sleep 30
+        fi
+        
+        # Handle Gateway Load Balancers (need VPC Endpoint Service deletion first)
+        if [ -n "$GATEWAY_LBS" ]; then
+            echo ""
+            echo "   Deleting Gateway Load Balancers (with VPC Endpoint Services)..."
+            
+            # Step 1: Delete VPC Endpoint Services for Gateway LBs
+            delete_vpc_endpoint_services
+            
+            # Step 2: Delete Gateway Load Balancers
+            for LB_ARN in $GATEWAY_LBS; do
+                LB_NAME=$(aws elbv2 describe-load-balancers \
+                    --region $REGION \
+                    --load-balancer-arns $LB_ARN \
+                    --query 'LoadBalancers[0].LoadBalancerName' \
+                    --output text 2>/dev/null || echo "unknown")
+                
+                echo "      Deleting Gateway LB: $LB_NAME"
+                aws elbv2 delete-load-balancer \
+                    --region $REGION \
+                    --load-balancer-arn $LB_ARN 2>/dev/null && \
+                    echo "      ✓ Deleted" || \
+                    echo "      Failed to delete $LB_NAME (may need more time)"
+            done
+            
+            echo "      Waiting 45 seconds for Gateway LBs to delete..."
+            sleep 45
+        fi
+        
+        echo ""
+        echo "   ✓ Load balancer deletion complete"
+    else
+        echo "   No load balancers found for pod${POD_NUMBER}"
+    fi
+}
+
+delete_tgw_attachments() {
+    echo "🔗 Deleting Transit Gateway VPC Attachments..."
+    
+    # Find all TGW attachments for this pod's VPCs
+    TGW_ATTACHMENTS=$(aws ec2 describe-transit-gateway-vpc-attachments \
+        --region $REGION \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
+        --query 'TransitGatewayVpcAttachments[?State!=`deleted`].TransitGatewayAttachmentId' \
+        --output text 2>/dev/null || true)
+    
+    if [ -n "$TGW_ATTACHMENTS" ]; then
+        echo "   Found $(echo $TGW_ATTACHMENTS | wc -w | tr -d ' ') TGW attachment(s)"
+        for ATTACH_ID in $TGW_ATTACHMENTS; do
+            ATTACH_NAME=$(aws ec2 describe-transit-gateway-vpc-attachments \
+                --region $REGION \
+                --transit-gateway-attachment-ids $ATTACH_ID \
+                --query 'TransitGatewayVpcAttachments[0].Tags[?Key==`Name`].Value' \
+                --output text 2>/dev/null || echo "unknown")
+            
+            echo "   Deleting TGW Attachment: $ATTACH_ID ($ATTACH_NAME)"
+            aws ec2 delete-transit-gateway-vpc-attachment \
+                --region $REGION \
+                --transit-gateway-attachment-id $ATTACH_ID 2>/dev/null || \
+                echo "     Failed to delete $ATTACH_ID"
+        done
+        
+        # Wait for attachments to be deleted
+        echo "   Waiting for TGW attachments to delete..."
+        sleep 30
+        
+        # Verify deletion
+        REMAINING=$(aws ec2 describe-transit-gateway-vpc-attachments \
+            --region $REGION \
+            --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
+            --query 'TransitGatewayVpcAttachments[?State!=`deleted`].TransitGatewayAttachmentId' \
+            --output text 2>/dev/null || true)
+        
+        if [ -n "$REMAINING" ]; then
+            echo "   ⚠️  Some attachments still deleting, waiting another 30 seconds..."
+            sleep 30
+        fi
+    else
+        echo "   No TGW attachments found for pod${POD_NUMBER}"
+    fi
 }
 
 delete_network_interfaces() {
@@ -272,12 +512,15 @@ delete_security_groups() {
 
 delete_vpcs() {
     echo "🏢 Deleting VPCs and dependencies..."
-    sleep 15  # Wait for resources to be released
+    
+    # IMPORTANT: Wait longer for load balancers and network interfaces to fully release
+    echo "   Waiting 30 seconds for load balancer network interfaces to be fully released..."
+    sleep 30
     
     # Get ALL VPCs for this pod (including MCD-created ones)
     VPCS=$(aws ec2 describe-vpcs \
         --region $REGION \
-        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-vpc,pod${POD_NUMBER}-app2-vpc,pod${POD_NUMBER}-svpc-aws,pod${POD_NUMBER}-mgmt-vpc" \
         --query 'Vpcs[].VpcId' \
         --output text 2>/dev/null || true)
     
@@ -376,6 +619,9 @@ delete_vpcs() {
 # Execute cleanup in order
 delete_instances
 delete_key_pairs
+delete_load_balancers      # Delete MCD load balancers first
+delete_tgw_attachments     # Delete TGW attachments before trying to delete VPCs
+delete_vpc_endpoints       # Delete VPC Endpoints before ENIs
 delete_network_interfaces  # Delete ENIs before EIPs (ENIs may have EIPs attached)
 delete_eips
 delete_nat_gateways

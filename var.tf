@@ -6,11 +6,11 @@ variable "aws_access_key" {
 
 variable "pod_number" {
   type        = number
-  description = "Student pod number (1-60) - automatically configured by init-lab.sh"
+  description = "Student pod number (1-50) - automatically configured by init-lab.sh"
   
   validation {
-    condition     = var.pod_number >= 1 && var.pod_number <= 60
-    error_message = "Pod number must be between 1 and 60."
+    condition     = var.pod_number >= 1 && var.pod_number <= 50
+    error_message = "Pod number must be between 1 and 50."
   }
 }
 
@@ -23,4 +23,10 @@ variable "transit_gateway_name" {
   type        = string
   description = "Name for the Transit Gateway"
   default     = "mcd-transit-gateway"
+}
+
+variable "use_transit_gateway_for_routes" {
+  type        = bool
+  description = "If true, route traffic through Transit Gateway. If false, route through Internet Gateway."
+  default     = false  # Start with IGW routing, changed to true by 5-attach-tgw.sh
 }

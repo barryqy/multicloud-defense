@@ -43,8 +43,8 @@ if ! [[ "$POD_NUMBER" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-if [ "$POD_NUMBER" -lt 1 ] || [ "$POD_NUMBER" -gt 60 ]; then
-    echo "❌ Pod number must be between 1 and 60"
+if [ "$POD_NUMBER" -lt 1 ] || [ "$POD_NUMBER" -gt 50 ]; then
+    echo "❌ Pod number must be between 1 and 50"
     exit 1
 fi
 
@@ -125,7 +125,7 @@ region         = "us-east-1"
 pod_number     = $POD_NUMBER
 
 # pod_number is now pre-configured - no need to enter it again during terraform plan/apply
-# aws_secret_key is automatically fetched from https://pastebin.com/raw/er9293Dh
+# aws_secret_key is automatically fetched from the lab credential server
 
 EOF
 
@@ -177,7 +177,7 @@ echo ""
 echo "You can now deploy your lab environment:"
 echo ""
 echo "  🚀 Quick Deploy (Recommended):"
-echo "     ./deploy.sh"
+echo "     ./2-deploy.sh"
 echo ""
 echo "  Or manually with Terraform:"
 echo "     terraform init"
@@ -186,7 +186,7 @@ echo "     terraform apply"
 echo ""
 echo "💡 Your pod number ($POD_NUMBER) is now configured."
 echo "💡 You won't be prompted for password or pod number again!"
-echo "💡 The deploy.sh script handles re-deployments automatically!"
+echo "💡 The 2-deploy.sh script handles re-deployments automatically!"
 echo ""
 
 # Clean up

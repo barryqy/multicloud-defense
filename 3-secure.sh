@@ -77,10 +77,9 @@ echo "   • Web Application Firewall protection"
 echo "   • Ingress Gateway with threat protection"
 echo ""
 echo "4. 🏗️ Infrastructure Components"
-echo "   • Service VPC (192.168.${POD_NUMBER}.0/24)"
 echo "   • Gateway Load Balancer (GWLB)"
-echo "   • Network Load Balancer (NLB)"
 echo "   • Address & Service Objects"
+echo "   • Note: Service VPC already deployed in deploy.sh"
 echo ""
 
 # Check if infrastructure is deployed
@@ -131,13 +130,13 @@ else
 fi
 
 # Target only the security-related resources
+# Note: Service VPC is deployed in deploy.sh, not here
 SECURITY_TARGETS=(
     "ciscomcd_address_object.app1-egress-addr-object"
     "ciscomcd_address_object.app2-egress-addr-object"
     "ciscomcd_address_object.app1-ingress-addr-object"
     "ciscomcd_service_object.app1_svc_http"
     "ciscomcd_profile_dlp.block-ssn-dlp"
-    "ciscomcd_service_vpc.svpc-aws"
     "ciscomcd_policy_rule_set.egress_policy"
     "ciscomcd_policy_rules.egress-ew-policy-rules"
     "ciscomcd_policy_rule_set.ingress_policy"
@@ -228,19 +227,26 @@ if [ $APPLY_STATUS -eq 0 ] || [ "$ONLY_EXISTS_ERRORS" = true ]; then
     echo "  • Gateway: pod${POD_NUMBER}-ingress-gw-aws"
     echo ""
     echo "✓ Infrastructure:"
-    echo "  • Service VPC: 192.168.${POD_NUMBER}.0/24"
-    echo "  • Load Balancers: GWLB + NLB deployed"
+    echo "  • Security Gateways: Egress + Ingress deployed"
+    echo "  • Gateway Load Balancer (GWLB): MCD-managed"
+    echo "  • Service VPC: Already deployed (192.168.${POD_NUMBER}.0/24)"
     echo ""
     
     echo -e "${YELLOW}🧪 Test Your Security Configuration:${NC}"
     echo ""
     echo "1. Test DLP (Should be blocked):"
-    echo "   ssh -i pod${POD_NUMBER}-private-key ubuntu@\$(terraform output -raw app1-public-eip)"
+    echo "   ssh -i \$SSH_KEY ubuntu@\$APP1_PUBLIC_IP"
     echo "   curl -X POST https://webhook.site/your-unique-url -d 'SSN: 123-45-6789'"
     echo ""
     echo "2. Test East-West (Should succeed):"
-    echo "   ssh -i pod${POD_NUMBER}-private-key ubuntu@\$(terraform output -raw app1-public-eip)"
-    echo "   curl \$(terraform output -raw app2-public-eip)"
+    echo "   ssh -i \$SSH_KEY ubuntu@\$APP1_PUBLIC_IP"
+    echo "   curl http://\$APP2_PUBLIC_IP"
+    echo ""
+    echo "Copy-paste ready commands:"
+    source ./env-helper.sh
+    export_deployment_vars
+    echo "   ssh -i $SSH_KEY ubuntu@$APP1_PUBLIC_IP"
+    echo "   curl http://$APP2_PUBLIC_IP"
     echo ""
     echo "3. View policies in Cisco MCD Console:"
     echo "   https://defense.cisco.com"

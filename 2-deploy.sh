@@ -55,7 +55,7 @@ fi
 # Check if terraform.tfvars exists and has pod_number
 if [ ! -f terraform.tfvars ]; then
     echo -e "${RED}❌ terraform.tfvars not found${NC}"
-    echo "Please run ./init-lab.sh first to set up credentials"
+    echo "Please run ./1-init-lab.sh first to set up credentials"
     exit 1
 fi
 
@@ -63,7 +63,7 @@ POD_NUMBER=$(grep -E '^pod_number' terraform.tfvars 2>/dev/null | awk -F'=' '{pr
 
 if [ -z "$POD_NUMBER" ]; then
     echo -e "${RED}❌ pod_number not found in terraform.tfvars${NC}"
-    echo "Please run ./init-lab.sh first to configure your pod number"
+    echo "Please run ./1-init-lab.sh first to configure your pod number"
     exit 1
 fi
 
@@ -75,6 +75,26 @@ if ! [[ "$POD_NUMBER" =~ ^[0-9]+$ ]] || [ "$POD_NUMBER" -lt 1 ] || [ "$POD_NUMBE
 fi
 
 echo -e "${BLUE}📋 Pod Number: ${POD_NUMBER}${NC}"
+echo ""
+
+# CRITICAL: Verify shared TGW ID to protect against accidental modifications
+# The TGW is shared across all 50 pods and must never be changed
+EXPECTED_TGW="tgw-0a878e2f5870e2ccf"
+echo -e "${BLUE}🔒 Verifying shared Transit Gateway...${NC}"
+if terraform state list 2>/dev/null | grep -q "data.aws_ec2_transit_gateway.tgw"; then
+    ACTUAL_TGW=$(terraform state show 'data.aws_ec2_transit_gateway.tgw' 2>/dev/null | grep -m1 '^\s*id\s*=' | awk '{print $3}' | tr -d '"')
+    if [ -n "$ACTUAL_TGW" ] && [ "$ACTUAL_TGW" != "$EXPECTED_TGW" ]; then
+        echo -e "${RED}❌ CRITICAL ERROR: TGW ID mismatch!${NC}"
+        echo -e "${RED}   Expected (shared): $EXPECTED_TGW${NC}"
+        echo -e "${RED}   Found in state:    $ACTUAL_TGW${NC}"
+        echo ""
+                echo -e "${YELLOW}This could affect all 50 pods! Contact instructor immediately.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Shared TGW verified: $EXPECTED_TGW${NC}"
+else
+    echo -e "${BLUE}ℹ️  TGW will be loaded as data source${NC}"
+fi
 echo ""
 
 # Smart initialization - only when needed
@@ -177,58 +197,36 @@ IMPORTED_COUNT=0
         "ciscomcd_policy_rule_set:egress_policy:pod${POD_NUMBER}-egress-policy"
         "ciscomcd_policy_rule_set:ingress_policy:pod${POD_NUMBER}-ingress-policy"
         
-        # AWS Transit Gateway
-        "aws_ec2_transit_gateway:tgw:IMPORT_BY_TAG"
-        
         # AWS Key Pair
         "aws_key_pair:sshkeypair:pod${POD_NUMBER}-keypair"
+        
+        # App VPCs and Core Infrastructure
+        "aws_vpc:app_vpc[0]:IMPORT_BY_TAG:pod${POD_NUMBER}-app1-vpc"
+        "aws_vpc:app_vpc[1]:IMPORT_BY_TAG:pod${POD_NUMBER}-app2-vpc"
+        "aws_subnet:app_subnet[0]:IMPORT_BY_TAG:pod${POD_NUMBER}-app1-subnet"
+        "aws_subnet:app_subnet[1]:IMPORT_BY_TAG:pod${POD_NUMBER}-app2-subnet"
+        "aws_internet_gateway:int_gw:IMPORT_BY_TAG:pod${POD_NUMBER}-igw"
+        "aws_security_group:allow_all[0]:IMPORT_BY_NAME:pod${POD_NUMBER}-app1-sg"
+        "aws_security_group:allow_all[1]:IMPORT_BY_NAME:pod${POD_NUMBER}-app2-sg"
+        
+        # App Instances (CRITICAL: These must be created!)
+        "aws_instance:AppMachines[0]:IMPORT_BY_TAG:pod${POD_NUMBER}-app1"
+        "aws_instance:AppMachines[1]:IMPORT_BY_TAG:pod${POD_NUMBER}-app2"
+        
+        # Management VPC and Jumpbox
+        "aws_vpc:mgmt_vpc:IMPORT_BY_TAG:pod${POD_NUMBER}-mgmt-vpc"
+        "aws_subnet:mgmt_subnet:IMPORT_BY_TAG:pod${POD_NUMBER}-mgmt-subnet"
+        "aws_internet_gateway:mgmt_igw:IMPORT_BY_TAG:pod${POD_NUMBER}-mgmt-igw"
+        "aws_security_group:jumpbox_sg:IMPORT_BY_NAME:pod${POD_NUMBER}-jumpbox-sg"
+        "aws_instance:jumpbox:IMPORT_BY_TAG:pod${POD_NUMBER}-jumpbox"
     )
     
-    # Special handling for Transit Gateway (shared across all pods)
-    # CRITICAL: Only ONE TGW should exist for all 60 pods
-    # DO NOT import - it's a shared resource managed by lifecycle rules
-    import_tgw() {
-        echo -n "  • aws_ec2_transit_gateway.tgw (shared)... "
-        
-        # Check if already in state (using cached list)
-        if echo "$STATE_CACHE" | grep -q "^aws_ec2_transit_gateway.tgw$"; then
-            echo -e "${GREEN}✓${NC}"
-            return 0
-        fi
-        
-        # Check if AWS CLI is available
-        if ! command -v aws &>/dev/null; then
-            echo -e "${BLUE}(will be created/detected during apply)${NC}"
-            return 1
-        fi
-        
-        # Check if the SHARED TGW already exists (don't import, just inform)
-        TGW_ID=$(aws ec2 describe-transit-gateways \
-            --region us-east-1 \
-            --filters "Name=tag:Name,Values=multicloud-defense-lab-transit-gateway" "Name=state,Values=available" \
-            --query 'TransitGateways[0].TransitGatewayId' \
-            --output text 2>/dev/null || echo "")
-        
-        if [ -n "$TGW_ID" ] && [ "$TGW_ID" != "None" ] && [ "$TGW_ID" != "null" ]; then
-            # TGW exists - Terraform will use it (lifecycle rules prevent recreation)
-            echo -e "${GREEN}✓ (shared: $TGW_ID)${NC}"
-            return 0
-        fi
-        
-        echo -e "${BLUE}(will create new shared TGW)${NC}"
-        return 1
-    }
+    # NOTE: Transit Gateway (tgw-0a878e2f5870e2ccf) is now a DATA SOURCE in data.tf
+    # It is NEVER created or imported - it's a hardcoded reference to the shared TGW
+    # This eliminates any possibility of creating duplicate TGWs
     
     for resource_entry in "${RESOURCES_TO_IMPORT[@]}"; do
         IFS=':' read -r res_type res_name res_id <<< "$resource_entry"
-        
-        # Special handling for Transit Gateway
-        if [ "$res_id" == "IMPORT_BY_TAG" ]; then
-            if import_tgw; then
-                ((IMPORTED_COUNT++)) || true
-            fi
-            continue
-        fi
         
         echo -n "  • ${res_type}.${res_name}... "
         
@@ -385,15 +383,67 @@ if [ $APPLY_STATUS -eq 0 ]; then
     echo -e "${GREEN}✅ Deployment successful!${NC}"
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
     echo ""
+    
+    # Check for tainted resources (provisioner failures)
+    TAINTED_RESOURCES=$(terraform state list 2>/dev/null | while read resource; do
+        terraform state show "$resource" 2>/dev/null | grep -q "Tainted: true" && echo "$resource"
+    done)
+    
+    if [ -n "$TAINTED_RESOURCES" ]; then
+        echo -e "${YELLOW}⚠️  WARNING: Some resources are marked as TAINTED${NC}"
+        echo ""
+        echo "Tainted resources (provisioner failures):"
+        echo "$TAINTED_RESOURCES" | while read res; do
+            echo "  ❌ $res"
+        done
+        echo ""
+        
+        # Auto-untaint App instances (they're functional even if provisioners failed)
+        APP_INSTANCES=$(echo "$TAINTED_RESOURCES" | grep "aws_instance.AppMachines")
+        JUMPBOX_INSTANCE=$(echo "$TAINTED_RESOURCES" | grep "aws_instance.jumpbox")
+        
+        if [ -n "$APP_INSTANCES" ] || [ -n "$JUMPBOX_INSTANCE" ]; then
+            echo -e "${BLUE}ℹ️  Auto-untainting instances (they're functional, just SSH provisioning failed)...${NC}"
+            echo ""
+            
+            echo "$APP_INSTANCES" | while read res; do
+                if [ -n "$res" ]; then
+                    terraform untaint "$res" 2>&1 | grep -q "successfully" && \
+                        echo -e "  ${GREEN}✓${NC} Untainted $res" || \
+                        echo -e "  ${RED}✗${NC} Failed to untaint $res"
+                fi
+            done
+            
+            if [ -n "$JUMPBOX_INSTANCE" ]; then
+                terraform untaint "$JUMPBOX_INSTANCE" 2>&1 | grep -q "successfully" && \
+                    echo -e "  ${GREEN}✓${NC} Untainted $JUMPBOX_INSTANCE" || \
+                    echo -e "  ${RED}✗${NC} Failed to untaint $JUMPBOX_INSTANCE"
+            fi
+            
+            echo ""
+            echo -e "${GREEN}✓ Instances are now clean and won't be replaced on next deployment${NC}"
+            echo ""
+        fi
+        
+        # Check if any non-instance resources are still tainted
+        OTHER_TAINTED=$(echo "$TAINTED_RESOURCES" | grep -v "aws_instance")
+        if [ -n "$OTHER_TAINTED" ]; then
+            echo -e "${RED}⚠️  WARNING: Non-instance resources are still tainted:${NC}"
+            echo "$OTHER_TAINTED" | while read res; do
+                echo "  ❌ $res"
+            done
+            echo ""
+            echo "These may need manual attention. Contact instructor if unsure."
+            echo ""
+        fi
+    fi
+    
     echo "Your Multicloud Defense lab environment is now ready."
     echo ""
     
-    # Export environment variables and display server information
-    export POD_NUMBER=$(grep -E '^pod_number' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
-    export APP1_PUBLIC_IP=$(terraform output -raw app1-public-eip 2>/dev/null || echo "N/A")
-    export APP2_PUBLIC_IP=$(terraform output -raw app2-public-eip 2>/dev/null || echo "N/A")
-    export APP1_PRIVATE_IP=$(terraform output -raw app1-private-ip 2>/dev/null || echo "N/A")
-    export APP2_PRIVATE_IP=$(terraform output -raw app2-private-ip 2>/dev/null || echo "N/A")
+    # Export environment variables using helper
+    source ./env-helper.sh
+    export_deployment_vars
     
     echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
     echo -e "${BLUE}📡 Server Information${NC}"
@@ -401,15 +451,24 @@ if [ $APPLY_STATUS -eq 0 ]; then
     echo ""
     printf "%-15s %-20s %-20s %s\n" "Server" "Public IP" "Private IP" "SSH Command"
     echo "────────────────────────────────────────────────────────────────────────────────────────────────"
-    printf "%-15s %-20s %-20s %s\n" "App1" "$APP1_PUBLIC_IP" "$APP1_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP1_PUBLIC_IP}"
-    printf "%-15s %-20s %-20s %s\n" "App2" "$APP2_PUBLIC_IP" "$APP2_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP2_PUBLIC_IP}"
+    printf "%-15s %-20s %-20s %s\n" "Jumpbox" "$JUMPBOX_PUBLIC_IP" "N/A" "ssh -i $SSH_KEY ubuntu@$JUMPBOX_PUBLIC_IP"
+    printf "%-15s %-20s %-20s %s\n" "App1" "$APP1_PUBLIC_IP" "$APP1_PRIVATE_IP" "ssh -i $SSH_KEY ubuntu@$APP1_PUBLIC_IP"
+    printf "%-15s %-20s %-20s %s\n" "App2" "$APP2_PUBLIC_IP" "$APP2_PRIVATE_IP" "ssh -i $SSH_KEY ubuntu@$APP2_PUBLIC_IP"
     echo ""
     
-    echo "Next steps:"
-    echo "  • SSH into servers using commands above"
+    echo "Via Jumpbox (always works, unaffected by TGW routing):"
+    echo "  1. ssh -i $SSH_KEY ubuntu@$JUMPBOX_PUBLIC_IP"
+    echo "  2. Then from jumpbox:"
+    echo "       ssh ubuntu@app1  # or: ssh ubuntu@$APP1_PRIVATE_IP"
+    echo "       ssh ubuntu@app2  # or: ssh ubuntu@$APP2_PRIVATE_IP"
+    echo ""
+    
+    echo "Direct access (works with IGW routing, may not work with TGW):"
     echo "  • Test App1: http://${APP1_PUBLIC_IP}"
     echo "  • Test App2: http://${APP2_PUBLIC_IP}"
-    echo ""
+    
+    show_deployment_vars
+    
     echo -e "${BLUE}📖 Want to know what just happened? Read instructions on the left!${NC}"
     echo ""
 else
@@ -427,12 +486,9 @@ else
         echo "Your Multicloud Defense lab environment is ready."
         echo ""
         
-        # Export environment variables and display server information
-        export POD_NUMBER=$(grep -E '^pod_number' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
-        export APP1_PUBLIC_IP=$(terraform output -raw app1-public-eip 2>/dev/null || echo "N/A")
-        export APP2_PUBLIC_IP=$(terraform output -raw app2-public-eip 2>/dev/null || echo "N/A")
-        export APP1_PRIVATE_IP=$(terraform output -raw app1-private-ip 2>/dev/null || echo "N/A")
-        export APP2_PRIVATE_IP=$(terraform output -raw app2-private-ip 2>/dev/null || echo "N/A")
+        # Export environment variables using helper
+        source ./env-helper.sh
+        export_deployment_vars
         
         echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
         echo -e "${BLUE}📡 Server Information${NC}"
@@ -440,15 +496,24 @@ else
         echo ""
         printf "%-15s %-20s %-20s %s\n" "Server" "Public IP" "Private IP" "SSH Command"
         echo "────────────────────────────────────────────────────────────────────────────────────────────────"
-        printf "%-15s %-20s %-20s %s\n" "App1" "$APP1_PUBLIC_IP" "$APP1_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP1_PUBLIC_IP}"
-        printf "%-15s %-20s %-20s %s\n" "App2" "$APP2_PUBLIC_IP" "$APP2_PRIVATE_IP" "ssh -i pod${POD_NUMBER}-private-key ubuntu@${APP2_PUBLIC_IP}"
+        printf "%-15s %-20s %-20s %s\n" "Jumpbox" "$JUMPBOX_PUBLIC_IP" "N/A" "ssh -i $SSH_KEY ubuntu@$JUMPBOX_PUBLIC_IP"
+        printf "%-15s %-20s %-20s %s\n" "App1" "$APP1_PUBLIC_IP" "$APP1_PRIVATE_IP" "ssh -i $SSH_KEY ubuntu@$APP1_PUBLIC_IP"
+        printf "%-15s %-20s %-20s %s\n" "App2" "$APP2_PUBLIC_IP" "$APP2_PRIVATE_IP" "ssh -i $SSH_KEY ubuntu@$APP2_PUBLIC_IP"
         echo ""
         
-        echo "Next steps:"
-        echo "  • SSH into servers using commands above"
+        echo "Via Jumpbox (always works, unaffected by TGW routing):"
+        echo "  1. ssh -i $SSH_KEY ubuntu@$JUMPBOX_PUBLIC_IP"
+        echo "  2. Then from jumpbox:"
+        echo "       ssh ubuntu@app1  # or: ssh ubuntu@$APP1_PRIVATE_IP"
+        echo "       ssh ubuntu@app2  # or: ssh ubuntu@$APP2_PRIVATE_IP"
+        echo ""
+        
+        echo "Direct access (works with IGW routing, may not work with TGW):"
         echo "  • Test App1: http://${APP1_PUBLIC_IP}"
         echo "  • Test App2: http://${APP2_PUBLIC_IP}"
-        echo ""
+        
+        show_deployment_vars
+        
         echo -e "${BLUE}📖 Want to understand the deployment? Read the instructions on the left!${NC}"
         echo ""
         exit 0
