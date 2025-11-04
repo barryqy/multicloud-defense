@@ -60,6 +60,28 @@ fi
 export AWS_DEFAULT_REGION="us-east-1"
 
 echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Step 1: Cleaning up Multicloud Defense resources"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# Run MCD cleanup script first
+if [ -f "${SCRIPT_DIR}/cleanup-mcd-resources.sh" ]; then
+    echo "🔧 Running MCD resource cleanup..."
+    bash "${SCRIPT_DIR}/cleanup-mcd-resources.sh" "$POD_NUMBER" || {
+        echo "⚠️  MCD cleanup encountered issues, but continuing with AWS cleanup..."
+    }
+    echo ""
+else
+    echo "⚠️  MCD cleanup script not found, skipping MCD cleanup"
+    echo "   MCD resources may need to be manually deleted from the console"
+    echo ""
+fi
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Step 2: Cleaning up AWS resources"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
 echo "🔍 Finding resources for pod $POD_NUMBER..."
 echo ""
 

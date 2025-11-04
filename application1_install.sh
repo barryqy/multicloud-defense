@@ -1,10 +1,24 @@
 #!/bin/bash
-sudo apt-get update
-sudo apt-get install -y w3m
-sudo apt-get install -y apache2
+# Update package list and install required packages
+sudo apt-get update -y
+sudo apt-get install -y w3m apache2
+
+# Start and enable Apache
 sudo systemctl start apache2
 sudo systemctl enable apache2
-cd ../../var/www/html/
-sudo cp /home/ubuntu/aws-app.png /var/www/html/aws-app.png
-sudo cp /home/ubuntu/index.html /var/www/html/index.html
-sudo cp /home/ubuntu/status /var/www/html/status
+
+# Create status file directly (don't depend on file provisioners)
+echo "This is application 1" | sudo tee /var/www/html/status > /dev/null
+
+# Copy other files if they exist (uploaded by provisioners)
+if [ -f /home/ubuntu/aws-app.png ]; then
+    sudo cp /home/ubuntu/aws-app.png /var/www/html/aws-app.png
+fi
+
+if [ -f /home/ubuntu/index.html ]; then
+    sudo cp /home/ubuntu/index.html /var/www/html/index.html
+fi
+
+# Ensure proper permissions
+sudo chown -R www-data:www-data /var/www/html/
+sudo chmod -R 755 /var/www/html/

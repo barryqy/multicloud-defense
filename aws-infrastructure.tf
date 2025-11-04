@@ -118,11 +118,8 @@ resource "aws_route" "mgmt_to_tgw" {
   destination_cidr_block = "10.0.0.0/8"
   transit_gateway_id     = data.aws_ec2_transit_gateway.tgw.id
   
-  # Depend on TGW attachments (created by 5-attach-tgw.sh)
-  depends_on = [
-    aws_ec2_transit_gateway_vpc_attachment.app1_attachment,
-    aws_ec2_transit_gateway_vpc_attachment.app2_attachment
-  ]
+  # Note: No depends_on needed - the fileexists() check ensures TGW attachments exist
+  # The route is only created when tgw-attachments.tf exists (after 5-attach-tgw.sh)
 }
 
 resource "aws_route_table_association" "mgmt_rt_assoc" {
