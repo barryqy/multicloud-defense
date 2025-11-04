@@ -2,6 +2,27 @@
 # AWS Infrastructure - Application VMs and Networking
 #################################################################################################################################
 
+# Data source to get the latest Ubuntu 22.04 LTS AMI (patched, no CVEs)
+data "aws_ami" "ubuntu_2204" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical's AWS account ID
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
+
 # Locals for application installation scripts
 locals {
   application1_install = file("${path.module}/application1_install.sh")
@@ -165,7 +186,7 @@ resource "aws_key_pair" "sshkeypair" {
 
 resource "aws_instance" "AppMachines" {
   count         = 2
-  ami           = "ami-053b0d53c279acc90"
+  ami           = data.aws_ami.ubuntu_2204.id
   instance_type = "t2.micro"
   key_name      = "pod${var.pod_number}-keypair"
   user_data     = count.index == 0 ? local.application1_install : local.application2_install
@@ -272,7 +293,7 @@ resource "aws_network_interface" "application_interface" {
 #################################################################################################################################
 
 resource "aws_instance" "jumpbox" {
-  ami                         = "ami-0e2c8caa4b6378d8c"
+  ami                         = data.aws_ami.ubuntu_2204.id
   instance_type               = "t2.micro"
   subnet_id                   = aws_subnet.mgmt_subnet.id
   vpc_security_group_ids      = [aws_security_group.jumpbox_sg.id]
