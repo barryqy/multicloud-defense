@@ -57,6 +57,112 @@ fi
 echo -e "${GREEN}✓ Pod Number: ${POD_NUMBER}${NC}"
 echo ""
 
+# ════════════════════════════════════════════════════════════
+# Activate MCD Resources File
+# ════════════════════════════════════════════════════════════
+# Step 2 (2-deploy.sh) deploys AWS resources only.
+# Step 3 (this script) activates MCD resources for deployment.
+# ════════════════════════════════════════════════════════════
+
+echo -e "${YELLOW}🔧 Activating MCD resources...${NC}"
+
+if [ -f "mcd-resources.tf.disabled" ]; then
+    # Activate the MCD resources file
+    mv mcd-resources.tf.disabled mcd-resources.tf
+    echo -e "${GREEN}✓ MCD resources activated${NC}"
+elif [ -f "mcd-resources.tf" ]; then
+    echo -e "${GREEN}✓ MCD resources already active${NC}"
+else
+    echo -e "${RED}❌ mcd-resources.tf.disabled not found${NC}"
+    echo "This is required for deploying security resources."
+    exit 1
+fi
+
+echo ""
+
+# Import existing MCD resources (for container environments where state is lost)
+echo -e "${YELLOW}🔍 Checking for existing MCD resources...${NC}"
+echo ""
+
+# Function to silently import resources
+silent_import() {
+    local resource_type=$1
+    local resource_name=$2
+    local resource_id=$3
+    
+    # Check if already in state
+    if terraform state list 2>/dev/null | grep -q "^${resource_type}.${resource_name}$"; then
+        return 0
+    fi
+    
+    # Try to import silently
+    terraform import "${resource_type}.${resource_name}" "${resource_id}" > /dev/null 2>&1
+    return $?
+}
+
+IMPORTED_COUNT=0
+
+# Try to import MCD resources that might already exist
+echo -n "  • Service VPC... "
+if silent_import "ciscomcd_service_vpc" "svpc-aws" "pod${POD_NUMBER}-svpc-aws"; then
+    echo -e "${GREEN}✓ imported${NC}"
+    ((IMPORTED_COUNT++))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • DLP Profile... "
+if silent_import "ciscomcd_profile_dlp" "block-ssn-dlp" "pod${POD_NUMBER}-block-ssn"; then
+    echo -e "${GREEN}✓ imported${NC}"
+    ((IMPORTED_COUNT++))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • Address Objects... "
+ADDR_IMPORTED=0
+silent_import "ciscomcd_address_object" "app1-egress-addr-object" "pod${POD_NUMBER}-app1-egress" && ((ADDR_IMPORTED++)) || true
+silent_import "ciscomcd_address_object" "app2-egress-addr-object" "pod${POD_NUMBER}-app2-egress" && ((ADDR_IMPORTED++)) || true
+silent_import "ciscomcd_address_object" "app1-ingress-addr-object" "pod${POD_NUMBER}-app1-ingress" && ((ADDR_IMPORTED++)) || true
+silent_import "ciscomcd_address_object" "app2-ingress-addr-object" "pod${POD_NUMBER}-app2-ingress" && ((ADDR_IMPORTED++)) || true
+if [ $ADDR_IMPORTED -gt 0 ]; then
+    echo -e "${GREEN}✓ $ADDR_IMPORTED imported${NC}"
+    IMPORTED_COUNT=$((IMPORTED_COUNT + ADDR_IMPORTED))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • Service Objects... "
+SVC_IMPORTED=0
+silent_import "ciscomcd_service_object" "app1_svc_http" "pod${POD_NUMBER}-app1" && ((SVC_IMPORTED++)) || true
+silent_import "ciscomcd_service_object" "app2_svc_http" "pod${POD_NUMBER}-app2" && ((SVC_IMPORTED++)) || true
+if [ $SVC_IMPORTED -gt 0 ]; then
+    echo -e "${GREEN}✓ $SVC_IMPORTED imported${NC}"
+    IMPORTED_COUNT=$((IMPORTED_COUNT + SVC_IMPORTED))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • Policy Rule Sets... "
+POLICY_IMPORTED=0
+silent_import "ciscomcd_policy_rule_set" "egress_policy" "pod${POD_NUMBER}-egress-policy" && ((POLICY_IMPORTED++)) || true
+silent_import "ciscomcd_policy_rule_set" "ingress_policy" "pod${POD_NUMBER}-ingress-policy" && ((POLICY_IMPORTED++)) || true
+if [ $POLICY_IMPORTED -gt 0 ]; then
+    echo -e "${GREEN}✓ $POLICY_IMPORTED imported${NC}"
+    IMPORTED_COUNT=$((IMPORTED_COUNT + POLICY_IMPORTED))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo ""
+if [ $IMPORTED_COUNT -gt 0 ]; then
+    echo -e "${GREEN}✓ Imported $IMPORTED_COUNT existing MCD resource(s)${NC}"
+    echo -e "${BLUE}ℹ️  This is normal in container environments where Terraform state is lost${NC}"
+else
+    echo -e "${BLUE}✓ No existing resources found - will create new ones${NC}"
+fi
+echo ""
+
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}🔒 Security Features to Deploy${NC}"
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
@@ -107,13 +213,6 @@ echo "  • IPS/WAF threat protection"
 echo ""
 echo "Estimated deployment time: 10-15 minutes"
 echo ""
-
-read -p "Continue with security deployment? (yes/no): " CONFIRM
-
-if [ "$CONFIRM" != "yes" ]; then
-    echo -e "${YELLOW}⚠️  Security deployment cancelled${NC}"
-    exit 0
-fi
 
 echo ""
 echo -e "${YELLOW}🔧 Initializing Terraform...${NC}"
@@ -232,31 +331,10 @@ if [ $APPLY_STATUS -eq 0 ] || [ "$ONLY_EXISTS_ERRORS" = true ]; then
     echo "  • Service VPC: Already deployed (192.168.${POD_NUMBER}.0/24)"
     echo ""
     
-    echo -e "${YELLOW}🧪 Test Your Security Configuration:${NC}"
-    echo ""
-    echo "1. Test DLP (Should be blocked):"
-    echo "   ssh -i \$SSH_KEY ubuntu@\$APP1_PUBLIC_IP"
-    echo "   curl -X POST https://webhook.site/your-unique-url -d 'SSN: 123-45-6789'"
-    echo ""
-    echo "2. Test East-West (Should succeed):"
-    echo "   ssh -i \$SSH_KEY ubuntu@\$APP1_PUBLIC_IP"
-    echo "   curl http://\$APP2_PUBLIC_IP"
-    echo ""
-    echo "Copy-paste ready commands:"
-    source ./env-helper.sh
-    export_deployment_vars
-    echo "   ssh -i $SSH_KEY ubuntu@$APP1_PUBLIC_IP"
-    echo "   curl http://$APP2_PUBLIC_IP"
-    echo ""
-    echo "3. View policies in Cisco MCD Console:"
-    echo "   https://defense.cisco.com"
-    echo "   Navigate to: Manage → Policy Rule Sets"
-    echo ""
-    
     # Cleanup
     rm -f security-tfplan
     
-    echo -e "${BLUE}📖 For more details, read instructions on the left!${NC}"
+    echo -e "${BLUE}📖 Next step: Run ./4-deploy-multicloud-gateway.sh${NC}"
     echo ""
     exit 0
 else

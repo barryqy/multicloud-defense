@@ -119,7 +119,21 @@ if [ "$SKIP_ATTACHMENT_CREATION" = false ]; then
     # Create a temporary Terraform file for TGW attachments
 cat > tgw-attachments.tf << 'EOFTF'
 # Transit Gateway VPC Attachments for Spoke VPCs
-# These attachments connect the application VPCs to the shared Transit Gateway
+# These attachments connect the application VPCs and management VPC to the shared Transit Gateway
+
+resource "aws_ec2_transit_gateway_vpc_attachment" "mgmt_attachment" {
+  transit_gateway_id = data.aws_ec2_transit_gateway.tgw.id
+  vpc_id             = aws_vpc.mgmt_vpc.id
+  subnet_ids         = [aws_subnet.mgmt_subnet.id]
+
+  tags = {
+    Name = "pod${var.pod_number}-mgmt-vpc-tgw-attachment"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
 
 resource "aws_ec2_transit_gateway_vpc_attachment" "app1_attachment" {
   transit_gateway_id = data.aws_ec2_transit_gateway.tgw.id
@@ -148,18 +162,30 @@ resource "aws_ec2_transit_gateway_vpc_attachment" "app2_attachment" {
     create_before_destroy = true
   }
 }
+
+# Route from Management VPC to App VPCs via TGW
+# This enables jumpbox to SSH to app instances
+resource "aws_route" "mgmt_to_apps" {
+  route_table_id         = aws_route_table.mgmt_rt.id
+  destination_cidr_block = "10.0.0.0/8"
+  transit_gateway_id     = data.aws_ec2_transit_gateway.tgw.id
+  
+  depends_on = [aws_ec2_transit_gateway_vpc_attachment.mgmt_attachment]
+}
 EOFTF
 
-    echo -e "${GREEN}✓ Created tgw-attachments.tf${NC}"
+    echo -e "${GREEN}✓ Created tgw-attachments.tf (includes mgmt VPC)${NC}"
     echo ""
 
     echo -e "${YELLOW}🚀 Running Terraform apply...${NC}"
     echo ""
 
-    # Define the resources to target - only TGW attachments
+    # Define the resources to target - TGW attachments + mgmt route
     TGW_TARGETS=(
+        "aws_ec2_transit_gateway_vpc_attachment.mgmt_attachment"
         "aws_ec2_transit_gateway_vpc_attachment.app1_attachment"
         "aws_ec2_transit_gateway_vpc_attachment.app2_attachment"
+        "aws_route.mgmt_to_apps"
     )
 
     # Build the target flags
@@ -205,11 +231,11 @@ echo ""
         echo "You may need to manually click 'Secure Now' in MCD Console."
         echo ""
     else
-        # Load MCD API credentials
-        API_KEY=$(jq -r '.apiKeyID' "$MCD_CREDS_FILE" 2>/dev/null)
-        API_SECRET=$(jq -r '.apiKeySecret' "$MCD_CREDS_FILE" 2>/dev/null)
-        ACCT_NAME=$(jq -r '.acctName' "$MCD_CREDS_FILE" 2>/dev/null)
-        BASE_URL="https://$(jq -r '.restAPIServer' "$MCD_CREDS_FILE" 2>/dev/null)"
+        # Load MCD API credentials (decode base64)
+        API_KEY=$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.apiKeyID' 2>/dev/null)
+        API_SECRET=$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.apiKeySecret' 2>/dev/null)
+        ACCT_NAME=$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.acctName' 2>/dev/null)
+        BASE_URL="https://$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.restAPIServer' 2>/dev/null)"
         
         if [ -z "$API_KEY" ] || [ "$API_KEY" == "null" ]; then
             echo -e "${YELLOW}⚠️  Invalid MCD API credentials${NC}"
@@ -376,14 +402,73 @@ echo ""
                 # CRITICAL: Add routes in Service VPC datapath for spoke VPC CIDRs
                 echo -e "${YELLOW}Adding spoke VPC routes to Service VPC datapath...${NC}"
                 
-                # Get Service VPC datapath route table
+                # Launch async route monitoring process in background
+                # This ensures routes are added even if datapath RT is still being created
+                nohup bash -c '
+                    # Wait for Service VPC datapath route table to be available
+                    MAX_ATTEMPTS=30  # 5 minutes (10s intervals)
+                    ATTEMPT=0
+                    
+                    while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+                        DATAPATH_RT=$(aws ec2 describe-route-tables --region us-east-1 \
+                            --filters "Name=vpc-id,Values='"$SVPC_AWS_ID"'" "Name=tag:Name,Values=*datapath*" \
+                            --query "RouteTables[0].RouteTableId" \
+                            --output text 2>/dev/null)
+                        
+                        if [ -n "$DATAPATH_RT" ] && [ "$DATAPATH_RT" != "None" ]; then
+                            # Found it! Add routes
+                            APP1_CIDR="10.'"$POD_NUMBER"'.0.0/16"
+                            APP2_CIDR="10.'"$((100 + POD_NUMBER))"'.0.0/16"
+                            
+                            # Try to add App1 route
+                            aws ec2 create-route --region us-east-1 \
+                                --route-table-id "$DATAPATH_RT" \
+                                --destination-cidr-block "$APP1_CIDR" \
+                                --transit-gateway-id "'"$TGW_ID"'" 2>/dev/null
+                            
+                            # Try to add App2 route
+                            aws ec2 create-route --region us-east-1 \
+                                --route-table-id "$DATAPATH_RT" \
+                                --destination-cidr-block "$APP2_CIDR" \
+                                --transit-gateway-id "'"$TGW_ID"'" 2>/dev/null
+                            
+                            # Verify routes were added
+                            ROUTE1=$(aws ec2 describe-route-tables --region us-east-1 \
+                                --route-table-ids "$DATAPATH_RT" \
+                                --query "RouteTables[0].Routes[?DestinationCidrBlock=='"'"'$APP1_CIDR'"'"'].State" \
+                                --output text 2>/dev/null)
+                            
+                            ROUTE2=$(aws ec2 describe-route-tables --region us-east-1 \
+                                --route-table-ids "$DATAPATH_RT" \
+                                --query "RouteTables[0].Routes[?DestinationCidrBlock=='"'"'$APP2_CIDR'"'"'].State" \
+                                --output text 2>/dev/null)
+                            
+                            if [ "$ROUTE1" = "active" ] && [ "$ROUTE2" = "active" ]; then
+                                echo "✓ Service VPC datapath routes configured successfully" >> logs/route-monitor-pod'"$POD_NUMBER"'.log
+                                exit 0
+                            fi
+                        fi
+                        
+                        ATTEMPT=$((ATTEMPT + 1))
+                        sleep 10
+                    done
+                    
+                    echo "⚠️  Timeout: Could not configure Service VPC datapath routes after 5 minutes" >> logs/route-monitor-pod'"$POD_NUMBER"'.log
+                ' > /dev/null 2>&1 &
+                
+                MONITOR_PID=$!
+                echo "  Route monitoring process started (PID: $MONITOR_PID)"
+                echo "  This process will add routes when datapath RT becomes available"
+                echo "  Log: logs/route-monitor-pod${POD_NUMBER}.log"
+                
+                # Try once immediately (in case RT already exists)
                 DATAPATH_RT=$(aws ec2 describe-route-tables --region us-east-1 \
                     --filters "Name=vpc-id,Values=$SVPC_AWS_ID" "Name=tag:Name,Values=*datapath*" \
                     --query "RouteTables[0].RouteTableId" \
                     --output text 2>/dev/null)
                 
                 if [ -n "$DATAPATH_RT" ] && [ "$DATAPATH_RT" != "None" ]; then
-                    echo "  Service VPC Datapath RT: $DATAPATH_RT"
+                    echo "  ✓ Service VPC Datapath RT found: $DATAPATH_RT"
                     
                     # Add route for App1 VPC CIDR
                     APP1_CIDR="10.${POD_NUMBER}.0.0/16"
@@ -391,7 +476,7 @@ echo ""
                     aws ec2 create-route --region us-east-1 \
                         --route-table-id "$DATAPATH_RT" \
                         --destination-cidr-block "$APP1_CIDR" \
-                        --transit-gateway-id "$TGW_ID" 2>/dev/null || echo "    (Route may already exist)"
+                        --transit-gateway-id "$TGW_ID" 2>&1 | grep -v "RouteAlreadyExists" || echo "    ✓ Route added"
                     
                     # Add route for App2 VPC CIDR
                     APP2_CIDR="10.$((100 + POD_NUMBER)).0.0/16"
@@ -399,11 +484,11 @@ echo ""
                     aws ec2 create-route --region us-east-1 \
                         --route-table-id "$DATAPATH_RT" \
                         --destination-cidr-block "$APP2_CIDR" \
-                        --transit-gateway-id "$TGW_ID" 2>/dev/null || echo "    (Route may already exist)"
+                        --transit-gateway-id "$TGW_ID" 2>&1 | grep -v "RouteAlreadyExists" || echo "    ✓ Route added"
                     
                     echo -e "${GREEN}  ✓ Service VPC datapath routes configured${NC}"
                 else
-                    echo -e "${YELLOW}  ⚠️  Could not find Service VPC datapath route table${NC}"
+                    echo -e "${YELLOW}  ⏳ Datapath RT not yet available - background monitor will add routes${NC}"
                 fi
                 echo ""
                 
@@ -438,6 +523,104 @@ echo ""
                     echo -e "${GREEN}  ✓ Service VPC NAT Egress routes configured${NC}"
                 else
                     echo -e "${YELLOW}  ⚠️  Could not find Service VPC NAT Egress route table${NC}"
+                fi
+                echo ""
+                
+                # ════════════════════════════════════════════════════════════════════════════════════════════════
+                # CRITICAL: Configure TGW Route Table for Egress Traffic
+                # ════════════════════════════════════════════════════════════════════════════════════════════════
+                # The shared TGW has a blackhole default route (0.0.0.0/0) for security by default.
+                # We need to replace it with a route to THIS pod's Service VPC for egress to work.
+                # ════════════════════════════════════════════════════════════════════════════════════════════════
+                
+                echo -e "${YELLOW}Configuring Transit Gateway routing for egress traffic...${NC}"
+                echo -e "${BLUE}Note: This is a shared TGW - configuring routes carefully${NC}"
+                echo ""
+                
+                # Get TGW route table ID
+                TGW_RT_ID=$(aws ec2 describe-transit-gateway-route-tables --region us-east-1 \
+                    --filters "Name=transit-gateway-id,Values=$TGW_ID" \
+                    --query "TransitGatewayRouteTables[0].TransitGatewayRouteTableId" \
+                    --output text 2>/dev/null)
+                
+                if [ -n "$TGW_RT_ID" ] && [ "$TGW_RT_ID" != "None" ]; then
+                    echo "  TGW Route Table: $TGW_RT_ID"
+                    
+                    # Check if default route exists
+                    DEFAULT_ROUTE_STATE=$(aws ec2 search-transit-gateway-routes \
+                        --region us-east-1 \
+                        --transit-gateway-route-table-id "$TGW_RT_ID" \
+                        --filters "Name=state,Values=active,blackhole" \
+                        --query "Routes[?DestinationCidrBlock=='0.0.0.0/0'].State" \
+                        --output text 2>/dev/null)
+                    
+                    if [ "$DEFAULT_ROUTE_STATE" = "blackhole" ]; then
+                        echo -e "  ${YELLOW}⚠️  Found blackhole default route (egress traffic being dropped!)${NC}"
+                        echo "  Replacing with route to Service VPC..."
+                        
+                        # Delete blackhole route
+                        aws ec2 delete-transit-gateway-route \
+                            --region us-east-1 \
+                            --transit-gateway-route-table-id "$TGW_RT_ID" \
+                            --destination-cidr-block 0.0.0.0/0 > /dev/null 2>&1
+                        
+                        # Wait for deletion to complete
+                        sleep 2
+                        
+                        # Add route to Service VPC
+                        aws ec2 create-transit-gateway-route \
+                            --region us-east-1 \
+                            --transit-gateway-route-table-id "$TGW_RT_ID" \
+                            --destination-cidr-block 0.0.0.0/0 \
+                            --transit-gateway-attachment-id "$SVPC_TGW_ATTACHMENT" > /dev/null 2>&1
+                        
+                        if [ $? -eq 0 ]; then
+                            echo -e "  ${GREEN}✓ Default route configured: 0.0.0.0/0 → Service VPC${NC}"
+                        else
+                            echo -e "  ${RED}✗ Failed to add default route${NC}"
+                        fi
+                    elif [ "$DEFAULT_ROUTE_STATE" = "active" ]; then
+                        # Check if it points to the correct Service VPC
+                        CURRENT_TARGET=$(aws ec2 search-transit-gateway-routes \
+                            --region us-east-1 \
+                            --transit-gateway-route-table-id "$TGW_RT_ID" \
+                            --filters "Name=state,Values=active" \
+                            --query "Routes[?DestinationCidrBlock=='0.0.0.0/0'].TransitGatewayAttachments[0].ResourceId" \
+                            --output text 2>/dev/null)
+                        
+                        if [ "$CURRENT_TARGET" = "$SVPC_AWS_ID" ]; then
+                            echo -e "  ${GREEN}✓ Default route already points to this pod's Service VPC${NC}"
+                        else
+                            echo -e "  ${YELLOW}⚠️  Default route points to: $CURRENT_TARGET${NC}"
+                            echo -e "  ${YELLOW}⚠️  This may be another pod's Service VPC${NC}"
+                            echo -e "  ${YELLOW}⚠️  Updating to this pod's Service VPC...${NC}"
+                            
+                            # Delete existing route
+                            aws ec2 delete-transit-gateway-route \
+                                --region us-east-1 \
+                                --transit-gateway-route-table-id "$TGW_RT_ID" \
+                                --destination-cidr-block 0.0.0.0/0 > /dev/null 2>&1
+                            
+                            sleep 2
+                            
+                            # Add route to this pod's Service VPC
+                            aws ec2 create-transit-gateway-route \
+                                --region us-east-1 \
+                                --transit-gateway-route-table-id "$TGW_RT_ID" \
+                                --destination-cidr-block 0.0.0.0/0 \
+                                --transit-gateway-attachment-id "$SVPC_TGW_ATTACHMENT" > /dev/null 2>&1
+                            
+                            if [ $? -eq 0 ]; then
+                                echo -e "  ${GREEN}✓ Default route updated to this pod's Service VPC${NC}"
+                            else
+                                echo -e "  ${RED}✗ Failed to update default route${NC}"
+                            fi
+                        fi
+                    else
+                        echo -e "  ${GREEN}✓ Default route already configured${NC}"
+                    fi
+                else
+                    echo -e "  ${RED}✗ Could not find TGW route table${NC}"
                 fi
                 echo ""
             fi

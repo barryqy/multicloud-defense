@@ -85,11 +85,15 @@ if [ -z "$API_RESPONSE" ]; then
     exit 1
 fi
 
-# Extract credentials using Python
-MCD_CREDS=$(echo "$API_RESPONSE" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('API_KEY_FILE',''))" 2>/dev/null)
+# Extract MCD credentials - NEW FORMAT: MCD_API_KEY contains complete JSON
+MCD_API_KEY_JSON=$(echo "$API_RESPONSE" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('MCD_API_KEY',''))" 2>/dev/null)
 
-if [ -z "$MCD_CREDS" ]; then
+if [ -n "$MCD_API_KEY_JSON" ]; then
+    # New format: MCD_API_KEY contains complete JSON with all fields
+    echo "✓ Using new MCD_API_KEY format (complete JSON)"
+else
     echo "❌ Failed to parse MCD credentials"
+    echo "   MCD_API_KEY field not found in response"
     exit 1
 fi
 
@@ -106,13 +110,54 @@ echo "📝 Writing credential files..."
 AWS_CRED_FILE=".terraform/.aws-secret.key"
 MCD_CRED_FILE=".terraform/.mcd-api.json"
 
+# Write AWS credentials
 echo -n "$AWS_SECRET" > "$AWS_CRED_FILE"
-echo -n "$MCD_CREDS" > "$MCD_CRED_FILE"
+
+# Write MCD credentials - store FULL JSON and base64 encode (like AWS)
+# The ciscomcd Terraform provider needs ALL fields from the API key
+echo "$API_RESPONSE" > /tmp/mcd_api_response.json
+
+python3 << 'PYSCRIPT' > "$MCD_CRED_FILE"
+import json, base64, sys
+
+try:
+    # Read API response
+    with open('/tmp/mcd_api_response.json', 'r') as f:
+        response = json.load(f)
+    
+    # Get MCD_API_KEY (it's a JSON string within the response)
+    mcd_json_str = response.get('MCD_API_KEY', '')
+    
+    if not mcd_json_str:
+        sys.exit(1)
+    
+    # Parse the MCD_API_KEY JSON - this contains ALL fields needed by the provider
+    mcd_data = json.loads(mcd_json_str)
+    
+    # Store the FULL JSON (ciscomcd Terraform provider needs all fields)
+    # This includes: apiKeyID, apiKeySecret, publicKey, privateKey,
+    # apiServer, apiServerPort, restAPIServer, restAPIServerPort, etc.
+    full_json_str = json.dumps(mcd_data)
+    
+    # Base64 encode for obfuscation (same as AWS credentials)
+    encoded = base64.b64encode(full_json_str.encode()).decode()
+    print(encoded, end='')
+except Exception as e:
+    sys.exit(1)
+PYSCRIPT
+
+if [ $? -ne 0 ] || [ ! -s "$MCD_CRED_FILE" ]; then
+    echo "❌ Failed to process MCD credentials"
+    rm -f /tmp/mcd_api_response.json
+    exit 1
+fi
+
+rm -f /tmp/mcd_api_response.json
 
 chmod 600 "$AWS_CRED_FILE"
 chmod 600 "$MCD_CRED_FILE"
 
-echo "✓ Credential files created"
+echo "✓ Credential files created (base64 encoded)"
 echo "  - $AWS_CRED_FILE"
 echo "  - $MCD_CRED_FILE"
 echo ""
