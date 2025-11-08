@@ -510,9 +510,18 @@ echo ""
 # Step 3: Apply the plan
 echo -e "${YELLOW}🚀 Deploying lab environment...${NC}"
 echo ""
+echo -e "${BLUE}Deployment Progress:${NC}"
+echo "  → Creating VPCs and networking..."
+echo "  → Launching EC2 instances (App1, App2, Jumpbox)..."
+echo "  → Configuring security groups and routes..."
+echo "  → This will take approximately 8-12 minutes"
+echo ""
+echo -e "${YELLOW}💡 Tip: Watch for 'Creation complete' messages below${NC}"
+echo ""
 
 # Capture output and filter "already exists" errors that we'll handle gracefully
-APPLY_OUTPUT=$(terraform apply -input=false -auto-approve tfplan 2>&1 | sanitize_output)
+# Using tee to show real-time progress to students
+APPLY_OUTPUT=$(terraform apply -input=false -auto-approve tfplan 2>&1 | tee /dev/tty | sanitize_output)
 APPLY_STATUS=$?
 
 # Check if there are ONLY "already exists" errors (which we handle gracefully)
