@@ -201,74 +201,18 @@ resource "aws_instance" "AppMachines" {
     aws_internet_gateway.int_gw
   ]
 
-  # IMPORTANT: Provisioners may fail when TGW routing is enabled (traffic goes through MCD)
-  # Using on_failure = continue ensures instances are created even if SSH provisioning fails
-  # Files can be deployed manually via user_data or through jumpbox after TGW attachment
-  
-  # Wait for instance to be ready and SSH available
-  provisioner "remote-exec" {
-    on_failure = continue
-    
-    inline = [
-      "echo 'Waiting for cloud-init to complete...'",
-      "cloud-init status --wait",
-      "echo 'Instance is ready for provisioning'"
-    ]
-
-    connection {
-      type        = "ssh"
-      user        = "ubuntu"
-      private_key = tls_private_key.key_pair.private_key_openssh
-      host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "5m"
-    }
-  }
-
-  provisioner "file" {
-    on_failure = continue
-    
-    source      = "./images/aws-app${count.index + 1}.png"
-    destination = "/home/ubuntu/aws-app.png"
-
-    connection {
-      type        = "ssh"
-      user        = "ubuntu"
-      private_key = tls_private_key.key_pair.private_key_openssh
-      host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "5m"
-    }
-  }
-
-  provisioner "file" {
-    on_failure = continue
-    
-    source      = "./html/index.html"
-    destination = "/home/ubuntu/index.html"
-
-    connection {
-      type        = "ssh"
-      user        = "ubuntu"
-      private_key = tls_private_key.key_pair.private_key_openssh
-      host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "5m"
-    }
-  }
-
-  provisioner "file" {
-    on_failure = continue
-    
-    source      = "./html/status${count.index + 1}"
-    destination = "/home/ubuntu/status"
-
-    connection {
-      type        = "ssh"
-      user        = "ubuntu"
-      private_key = tls_private_key.key_pair.private_key_openssh
-      host        = aws_eip.app-EIP["${count.index}"].public_ip
-      timeout     = "5m"
-    }
-  }
-
+  # DEPLOYMENT OPTIMIZATION:
+  # SSH provisioners have been removed to speed up deployment by 3-5 minutes.
+  # All application setup is handled by cloud-init (user_data script).
+  # The cloud-init script:
+  #   - Installs Apache web server
+  #   - Creates /var/www/html/status file
+  #   - Creates default index.html
+  # This approach is:
+  #   ✓ Faster (no waiting for SSH to be ready - saves 3-5 min)
+  #   ✓ More reliable (works even if security groups block external SSH)
+  #   ✓ Container-friendly (no external SSH dependencies)
+  #   ✓ Idempotent (cloud-init runs once on first boot)
 
   tags = {
     Name = "pod${var.pod_number}-app${count.index + 1}"
@@ -298,6 +242,22 @@ resource "aws_instance" "jumpbox" {
   associate_public_ip_address = true
   key_name                    = aws_key_pair.sshkeypair.key_name
 
+  # Use cloud-init to configure jumpbox (faster and more reliable than SSH provisioners)
+  user_data = <<-EOF
+              #!/bin/bash
+              # Setup SSH key for accessing app instances
+              mkdir -p /home/ubuntu/.ssh
+              cat > /home/ubuntu/.ssh/id_rsa <<'SSHKEY'
+${tls_private_key.key_pair.private_key_openssh}
+SSHKEY
+              chmod 600 /home/ubuntu/.ssh/id_rsa
+              chown ubuntu:ubuntu /home/ubuntu/.ssh/id_rsa
+              
+              # Add app instances to /etc/hosts for easy access
+              echo '${local.app1_nic[0]} app1' >> /etc/hosts
+              echo '${local.app2_nic[0]} app2' >> /etc/hosts
+              EOF
+
   # Ensure keypair and networking are ready
   depends_on = [
     aws_internet_gateway.mgmt_igw,
@@ -305,42 +265,10 @@ resource "aws_instance" "jumpbox" {
     local_file.private_key
   ]
 
-  # IMPORTANT: Provisioners may fail in container environments
-  # Using on_failure = continue ensures jumpbox is created even if file copy fails
-  # SSH key can be copied manually if needed
-  
-  provisioner "file" {
-    on_failure = continue
-    
-    source      = "pod${var.pod_number}-private-key"
-    destination = "/home/ubuntu/.ssh/id_rsa"
-    
-    connection {
-      type        = "ssh"
-      user        = "ubuntu"
-      private_key = tls_private_key.key_pair.private_key_openssh
-      host        = self.public_ip
-      timeout     = "5m"
-    }
-  }
-
-  provisioner "remote-exec" {
-    on_failure = continue
-    
-    inline = [
-      "chmod 600 /home/ubuntu/.ssh/id_rsa",
-      "echo '${local.app1_nic[0]} app1' | sudo tee -a /etc/hosts",
-      "echo '${local.app2_nic[0]} app2' | sudo tee -a /etc/hosts"
-    ]
-    
-    connection {
-      type        = "ssh"
-      user        = "ubuntu"
-      private_key = tls_private_key.key_pair.private_key_openssh
-      host        = self.public_ip
-      timeout     = "5m"
-    }
-  }
+  # DEPLOYMENT OPTIMIZATION:
+  # SSH provisioners have been removed for jumpbox too.
+  # All configuration (SSH key, /etc/hosts) is handled by cloud-init above.
+  # This is faster and works even in container environments.
 
   tags = {
     Name = "pod${var.pod_number}-jumpbox"

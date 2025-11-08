@@ -47,20 +47,41 @@ fi
 echo -e "${BLUE}Pod Number: ${POD_NUMBER}${NC}"
 echo ""
 
-# Check if MCD API credentials exist
-MCD_CREDS_FILE="../.terraform/.mcd-api.json"
-if [ ! -f "$MCD_CREDS_FILE" ]; then
-    echo -e "${YELLOW}⚠️  MCD API credentials not found at: $MCD_CREDS_FILE${NC}"
+# Determine the correct path to .terraform directory
+# This script can be called from cleanup/ directory or project root
+if [ -d "../.terraform" ]; then
+    # Called from cleanup/ subdirectory
+    MCD_CREDS_FILE="../.terraform/.mcd-api.json"
+elif [ -d ".terraform" ]; then
+    # Called from project root
+    MCD_CREDS_FILE=".terraform/.mcd-api.json"
+else
+    echo -e "${YELLOW}⚠️  MCD credentials directory not found${NC}"
     echo ""
-    echo "Cannot clean up MCD resources without API credentials."
-    echo "If resources exist in MCD, you'll need to manually delete them:"
-    echo "  1. Log into MCD Console"
+    echo "This usually means you haven't run 1-init-lab.sh yet."
+    echo ""
+    echo "MCD resources will be skipped in cleanup."
+    echo "If you deployed MCD resources, you can manually delete them:"
+    echo "  1. Log into MCD Console: https://prod1.mcd.us.cdo.cisco.com"
     echo "  2. Navigate to each section and delete pod${POD_NUMBER} resources:"
-    echo "     • Manage → Gateways"
-    echo "     • Manage → Service VPCs"
+    echo "     • Manage → Gateways → Delete pod${POD_NUMBER}-*-gw"
+    echo "     • Manage → Service VPCs → Delete pod${POD_NUMBER}-svpc-aws"
     echo "     • Manage → Profiles → Security Policies → Rule Sets"
-    echo "     • Manage → Profiles → DLP"
+    echo "     • Manage → Profiles → DLP → Delete pod${POD_NUMBER}-block-ssn"
     echo "     • Manage → Network Objects"
+    echo ""
+    exit 0
+fi
+
+# Check if MCD API credentials exist
+if [ ! -f "$MCD_CREDS_FILE" ]; then
+    echo -e "${YELLOW}⚠️  MCD API credentials file not found${NC}"
+    echo -e "${YELLOW}   Expected: $MCD_CREDS_FILE${NC}"
+    echo ""
+    echo "This usually means you haven't run 1-init-lab.sh to fetch credentials."
+    echo ""
+    echo "MCD resources will be skipped in cleanup."
+    echo "If you deployed MCD resources, you can manually delete them from the console."
     echo ""
     exit 0
 fi
