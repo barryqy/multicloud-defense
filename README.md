@@ -75,11 +75,70 @@ Internet → Ingress Gateway → Transit Gateway → Application VPCs → Egress
 
 ## 📋 Prerequisites
 
+### For Students
 - **Pod Number** (1-50) - Assigned by instructor
 - **Lab Password** - Provided by instructor
 - **Lab Environment** - Pre-configured container with Terraform, Python, AWS CLI
 
 All dependencies are pre-installed in the lab environment. Students just run the scripts!
+
+### For Lab Administrators (One-Time Setup)
+
+**IAM Role Required:** The AWS account must have an IAM role named `ciscomcd-gateway-role` for MCD gateways to deploy.
+
+<details>
+<summary>Click to expand IAM role setup instructions</summary>
+
+**Why it's needed:** MCD gateway EC2 instances require this IAM role to interact with AWS services (VPC, CloudWatch, etc.).
+
+**Create the role (AWS CLI):**
+```bash
+# 1. Create trust policy
+cat > /tmp/trust-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "ec2.amazonaws.com"},
+    "Action": "sts:AssumeRole"
+  }]
+}
+EOF
+
+# 2. Create role
+aws iam create-role \
+  --role-name ciscomcd-gateway-role \
+  --assume-role-policy-document file:///tmp/trust-policy.json
+
+# 3. Attach policies
+aws iam attach-role-policy \
+  --role-name ciscomcd-gateway-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonVPCFullAccess
+
+aws iam attach-role-policy \
+  --role-name ciscomcd-gateway-role \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+aws iam attach-role-policy \
+  --role-name ciscomcd-gateway-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+# 4. Create instance profile
+aws iam create-instance-profile --instance-profile-name ciscomcd-gateway-role
+aws iam add-role-to-instance-profile \
+  --instance-profile-name ciscomcd-gateway-role \
+  --role-name ciscomcd-gateway-role
+```
+
+**Or via AWS Console:**
+1. Go to IAM → Roles → Create role
+2. Select: AWS service → EC2
+3. Attach policies: VPCFullAccess, CloudWatchAgentServerPolicy, EC2ReadOnlyAccess
+4. Name: `ciscomcd-gateway-role`
+
+**This is done ONCE per AWS account, not per pod.**
+
+</details>
 
 ---
 
@@ -124,8 +183,14 @@ This removes all deployed resources (VPCs, EC2s, gateways, policies) to avoid AW
 
 ## 🔒 Security Features
 
+**Pod-Specific State Isolation:**
+- Each pod maintains its own Terraform state file
+- Pod switching is automatic and safe (no cleanup required)
+- State stored in `.terraform/states/pod${NUMBER}/`
+- Prevents accidental cross-pod resource modifications
+
 **Container-Friendly Design:**
-- Terraform state is ephemeral (lost when container restarts)
+- Terraform state persists via pod-specific directories
 - Scripts automatically detect and import existing resources
 - No manual intervention needed for re-deployments
 

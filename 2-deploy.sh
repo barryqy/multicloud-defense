@@ -77,6 +77,165 @@ fi
 echo -e "${BLUE}📋 Pod Number: ${POD_NUMBER}${NC}"
 echo ""
 
+# ════════════════════════════════════════════════════════════
+# Pod-Specific State Management
+# ════════════════════════════════════════════════════════════
+echo -e "${YELLOW}🔧 Setting up pod-specific state...${NC}"
+
+# Source state helper
+if [ ! -f ".state-helper.sh" ]; then
+    echo -e "${RED}❌ State helper script not found${NC}"
+    exit 1
+fi
+
+source .state-helper.sh
+
+# Setup pod-specific state directory and symlinks
+if ! setup_pod_state; then
+    echo -e "${RED}❌ Failed to setup pod-specific state${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✅ Using isolated state for pod${POD_NUMBER}${NC}"
+echo ""
+
+# ════════════════════════════════════════════════════════════
+# Ensure MCD Resources are Disabled (Step 2 = AWS Only)
+# ════════════════════════════════════════════════════════════
+# Step 2 deploys AWS infrastructure only.
+# MCD resources are deployed in Step 3 (3-secure.sh).
+# ════════════════════════════════════════════════════════════
+
+echo -e "${YELLOW}🔧 Ensuring AWS-only deployment...${NC}"
+
+if [ -f "mcd-resources.tf" ]; then
+    # Deactivate MCD resources for this step
+    mv mcd-resources.tf mcd-resources.tf.disabled
+    echo -e "${GREEN}✓ MCD resources disabled (will be deployed in Step 3)${NC}"
+elif [ -f "mcd-resources.tf.disabled" ]; then
+    echo -e "${GREEN}✓ MCD resources already disabled${NC}"
+else
+    # If neither exists, that's okay - might be a fresh checkout
+    echo -e "${BLUE}ℹ️  No MCD resources file found (will be created if needed)${NC}"
+fi
+
+echo -e "${BLUE}ℹ️  Step 2 deploys: VPCs, EC2 instances, Transit Gateway${NC}"
+echo -e "${BLUE}ℹ️  Step 3 deploys: MCD policies, Service VPC, gateways${NC}"
+echo ""
+
+# ════════════════════════════════════════════════════════════
+# Pre-Deployment Check: Detect Existing Resources
+# ════════════════════════════════════════════════════════════
+echo -e "${YELLOW}🔍 Checking for existing resources...${NC}"
+
+REGION="us-east-1"
+
+# Check for existing EC2 instances
+EXISTING_INSTANCES=$(aws ec2 describe-instances --region $REGION \
+    --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1,pod${POD_NUMBER}-app2,pod${POD_NUMBER}-jumpbox" \
+              "Name=instance-state-name,Values=running,pending,stopped" \
+    --query "Reservations[].Instances[].InstanceId" \
+    --output text 2>/dev/null | wc -w | tr -d ' ')
+
+# Check for existing VPCs
+EXISTING_VPCS=$(aws ec2 describe-vpcs --region $REGION \
+    --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-vpc,pod${POD_NUMBER}-app2-vpc,pod${POD_NUMBER}-mgmt-vpc" \
+    --query "Vpcs[].VpcId" \
+    --output text 2>/dev/null | wc -w | tr -d ' ')
+
+# Check for existing TGW attachments (indicates previous deployment)
+EXISTING_TGW_ATTACH=$(aws ec2 describe-transit-gateway-attachments --region $REGION \
+    --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
+              "Name=state,Values=available,pending" \
+    --query "TransitGatewayAttachments[].TransitGatewayAttachmentId" \
+    --output text 2>/dev/null | wc -w | tr -d ' ')
+
+# Check for MCD gateways (via instance names)
+EXISTING_MCD_GW=$(aws ec2 describe-instances --region $REGION \
+    --filters "Name=tag:Name,Values=*pod${POD_NUMBER}*gw*" \
+              "Name=instance-state-name,Values=running,pending" \
+    --query "Reservations[].Instances[].InstanceId" \
+    --output text 2>/dev/null | wc -w | tr -d ' ')
+
+TOTAL_EXISTING=$((EXISTING_INSTANCES + EXISTING_VPCS + EXISTING_TGW_ATTACH + EXISTING_MCD_GW))
+
+if [ "$TOTAL_EXISTING" -gt 0 ]; then
+    echo ""
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}⚠️  WARNING: Existing Resources Detected!${NC}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${RED}Found existing resources for pod${POD_NUMBER}:${NC}"
+    echo "  • EC2 Instances: $EXISTING_INSTANCES"
+    echo "  • VPCs: $EXISTING_VPCS"
+    echo "  • TGW Attachments: $EXISTING_TGW_ATTACH"
+    echo "  • MCD Gateways: $EXISTING_MCD_GW"
+    echo ""
+    echo -e "${YELLOW}Deploying now will create DUPLICATES (same names, different resources)${NC}"
+    echo ""
+    echo -e "${BLUE}This can happen if:${NC}"
+    echo "  • Previous deployment wasn't cleaned up"
+    echo "  • Terraform state was lost (container restart)"
+    echo "  • Manual resources were created"
+    echo ""
+    echo -e "${GREEN}Recommended Actions:${NC}"
+    echo "  1. ${GREEN}Clean up first${NC}: ./cleanup/cleanup.sh $POD_NUMBER"
+    echo "  2. Use a different pod number"
+    echo "  3. Continue anyway (will import existing resources)"
+    echo ""
+    
+    # Give user options
+    echo -e "${YELLOW}What would you like to do?${NC}"
+    echo "  [1] Run cleanup now and then continue deployment"
+    echo "  [2] Continue anyway (attempt to import existing resources)"
+    echo "  [3] Cancel deployment"
+    echo ""
+    read -p "Enter choice (1/2/3): " CHOICE
+    
+    case $CHOICE in
+        1)
+            echo ""
+            echo -e "${BLUE}Running cleanup for pod${POD_NUMBER}...${NC}"
+            echo ""
+            # Run cleanup with automatic confirmation
+            if ./cleanup/cleanup.sh $POD_NUMBER yes; then
+                echo ""
+                echo -e "${GREEN}✅ Cleanup complete! Proceeding with deployment...${NC}"
+                echo ""
+                # Wait a bit for AWS to fully process deletions
+                sleep 10
+            else
+                echo ""
+                echo -e "${RED}❌ Cleanup failed or incomplete${NC}"
+                echo "Please review the errors above and try again"
+                exit 1
+            fi
+            ;;
+        2)
+            echo ""
+            echo -e "${YELLOW}⚠️  Continuing with existing resources...${NC}"
+            echo "Will attempt to import them into Terraform state"
+            echo ""
+            ;;
+        3)
+            echo ""
+            echo -e "${BLUE}Deployment cancelled${NC}"
+            echo ""
+            echo "To clean up manually, run:"
+            echo "  ./cleanup/cleanup.sh $POD_NUMBER"
+            exit 0
+            ;;
+        *)
+            echo ""
+            echo -e "${RED}Invalid choice. Deployment cancelled.${NC}"
+            exit 1
+            ;;
+    esac
+else
+    echo -e "${GREEN}✓ No existing resources found - safe to deploy${NC}"
+fi
+echo ""
+
 # CRITICAL: Verify shared TGW ID to protect against accidental modifications
 # The TGW is shared across all 50 pods and must never be changed
 EXPECTED_TGW="tgw-0a878e2f5870e2ccf"

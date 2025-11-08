@@ -61,52 +61,30 @@ echo ""
 
 # STEP 1: DIAGNOSIS
 echo -e "${BLUE}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 1: Diagnosing Gateway Status${NC}"
+echo -e "${BLUE}Step 1: Verifying Gateway Deployment${NC}"
 echo -e "${BLUE}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
 echo ""
 
-# Check if Service VPC exists
-SVPC_EXISTS=$(terraform state list 2>/dev/null | grep -c "ciscomcd_service_vpc.svpc-aws" || echo "0")
-
-if [ "$SVPC_EXISTS" -eq 0 ]; then
-    echo -e "${RED}❌ Service VPC not found in Terraform state${NC}"
-    echo ""
-    echo "The Service VPC must be deployed before gateways can be created."
-    echo "Please run: ./secure.sh"
-    echo ""
-    exit 1
-fi
-
-# Get Service VPC details
-SVPC_AWS_ID=$(terraform state show ciscomcd_service_vpc.svpc-aws 2>/dev/null | grep vpc_id | awk -F'=' '{print $2}' | tr -d ' "' || echo "")
-SVPC_MCD_ID=$(terraform state show ciscomcd_service_vpc.svpc-aws 2>/dev/null | grep -E '^\s*id\s*=' | awk -F'=' '{print $2}' | tr -d ' "' || echo "")
-
-if [ -z "$SVPC_AWS_ID" ]; then
-    echo -e "${RED}❌ Unable to retrieve Service VPC information${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}✓ Service VPC found${NC}"
-echo "  • MCD ID: $SVPC_MCD_ID"
-echo "  • AWS VPC: $SVPC_AWS_ID"
+echo -e "${CYAN}Note: Gateways are deployed by 3-secure.sh using Terraform.${NC}"
+echo -e "${CYAN}This script verifies their status.${NC}"
 echo ""
 
 # Check Terraform state for gateways
-echo "Checking gateway resources in Terraform..."
+echo "Checking gateway resources in Terraform state..."
 
-EGRESS_EXISTS=$(terraform state list 2>/dev/null | grep -c "ciscomcd_gateway.aws-egress-gw" || echo "0")
-INGRESS_EXISTS=$(terraform state list 2>/dev/null | grep -c "ciscomcd_gateway.aws-ingress-gw" || echo "0")
+EGRESS_EXISTS=$(terraform state list 2>/dev/null | grep "ciscomcd_gateway.aws-egress-gw" | wc -l | tr -d ' ')
+INGRESS_EXISTS=$(terraform state list 2>/dev/null | grep "ciscomcd_gateway.aws-ingress-gw" | wc -l | tr -d ' ')
 
 EGRESS_TAINTED=0
 INGRESS_TAINTED=0
 
 if [ "$EGRESS_EXISTS" -eq 1 ]; then
-    EGRESS_TAINTED=$(terraform state show ciscomcd_gateway.aws-egress-gw 2>/dev/null | head -1 | grep -c "tainted" || echo "0")
+    EGRESS_TAINTED=$(terraform state show ciscomcd_gateway.aws-egress-gw 2>/dev/null | head -1 | grep "tainted" | wc -l | tr -d ' ')
     EGRESS_STATE=$(terraform state show ciscomcd_gateway.aws-egress-gw 2>/dev/null | grep gateway_state | awk -F'=' '{print $2}' | tr -d ' "' || echo "UNKNOWN")
 fi
 
 if [ "$INGRESS_EXISTS" -eq 1 ]; then
-    INGRESS_TAINTED=$(terraform state show ciscomcd_gateway.aws-ingress-gw 2>/dev/null | head -1 | grep -c "tainted" || echo "0")
+    INGRESS_TAINTED=$(terraform state show ciscomcd_gateway.aws-ingress-gw 2>/dev/null | head -1 | grep "tainted" | wc -l | tr -d ' ')
     INGRESS_STATE=$(terraform state show ciscomcd_gateway.aws-ingress-gw 2>/dev/null | grep gateway_state | awk -F'=' '{print $2}' | tr -d ' "' || echo "UNKNOWN")
 fi
 

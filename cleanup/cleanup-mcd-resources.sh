@@ -65,11 +65,11 @@ if [ ! -f "$MCD_CREDS_FILE" ]; then
     exit 0
 fi
 
-# Load MCD API credentials
-API_KEY=$(jq -r '.apiKeyID' "$MCD_CREDS_FILE" 2>/dev/null)
-API_SECRET=$(jq -r '.apiKeySecret' "$MCD_CREDS_FILE" 2>/dev/null)
-ACCT_NAME=$(jq -r '.acctName' "$MCD_CREDS_FILE" 2>/dev/null)
-BASE_URL="https://$(jq -r '.restAPIServer' "$MCD_CREDS_FILE" 2>/dev/null)"
+# Load MCD API credentials (decode base64)
+API_KEY=$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.apiKeyID' 2>/dev/null)
+API_SECRET=$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.apiKeySecret' 2>/dev/null)
+ACCT_NAME=$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.acctName' 2>/dev/null)
+BASE_URL="https://$(cat "$MCD_CREDS_FILE" | base64 -d | jq -r '.restAPIServer' 2>/dev/null)"
 
 if [ -z "$API_KEY" ] || [ "$API_KEY" == "null" ]; then
     echo -e "${RED}❌ Invalid MCD API credentials${NC}"
@@ -102,41 +102,66 @@ get_access_token() {
 
 # Function to delete a gateway
 delete_gateway() {
-    local gateway_name=$1
-    local gateway_type=$2  # "ingress" or "egress"
+    local gateway_type=$1  # "ingress" or "egress"
     
-    echo -e "${YELLOW}🔍 Looking for ${gateway_type} gateway: ${gateway_name}${NC}"
+    echo -e "${YELLOW}🔍 Looking for ${gateway_type} gateways for pod${POD_NUMBER}...${NC}"
     
-    # List all gateways and find the one we want
-    GATEWAYS_RESPONSE=$(curl -s -X POST "${BASE_URL}/api/v1/services/gwlb/gateway/list" \
+    # List all gateways and find any that contain pod number
+    GATEWAYS_RESPONSE=$(curl -s -k -X POST "${BASE_URL}/api/v1/gateway/list" \
         -H "Authorization: Bearer $ACCESS_TOKEN" \
         -H "Content-Type: application/json" \
-        -d "{\"common\":{\"acctName\":\"$ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"CiscoMCD-2024\"}}" 2>&1)
+        -d "{\"common\":{\"acctName\":\"$ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"Valtix-2022\"},\"detail\":true}" 2>&1)
     
-    # Extract gateway ID
-    GATEWAY_ID=$(echo "$GATEWAYS_RESPONSE" | jq -r ".gateways[] | select(.name == \"$gateway_name\") | .id" 2>/dev/null)
+    # Find ALL gateways matching pod number and type
+    # Look for patterns like: pod48-ingress-gw, ciscomcd-pod48-ingress-gw-aws-*, etc.
+    MATCHING_GATEWAYS=$(echo "$GATEWAYS_RESPONSE" | jq -r ".gateways[]? | select(.name | test(\"pod${POD_NUMBER}.*${gateway_type}\"; \"i\")) | .name" 2>/dev/null)
     
-    if [ -z "$GATEWAY_ID" ] || [ "$GATEWAY_ID" == "null" ]; then
-        echo -e "${BLUE}   ℹ️  Gateway not found (may already be deleted)${NC}"
+    if [ -z "$MATCHING_GATEWAYS" ]; then
+        echo -e "${BLUE}   ℹ️  No ${gateway_type} gateways found for pod${POD_NUMBER}${NC}"
         return 0
     fi
     
-    echo -e "${YELLOW}   • Found gateway ID: ${GATEWAY_ID}${NC}"
-    echo -e "${YELLOW}   • Deleting...${NC}"
+    # Delete each matching gateway
+    echo "$MATCHING_GATEWAYS" | while IFS= read -r gateway_name; do
+        if [ -n "$gateway_name" ]; then
+            echo -e "${YELLOW}   • Found gateway: ${gateway_name}${NC}"
+            
+            # CRITICAL: First DISABLE gateway (prevents auto-recreation of instances)
+            echo -e "${YELLOW}     - Disabling...${NC}"
+            DISABLE_RESPONSE=$(curl -s -k -X POST "${BASE_URL}/api/v1/gateway/disable" \
+                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"common\":{\"acctName\":\"$ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"Valtix-2022\"},\"name\":\"$gateway_name\"}" 2>&1)
+            
+            # Check for errors on disable
+            ERROR_MSG=$(echo "$DISABLE_RESPONSE" | jq -r '.error // empty' 2>/dev/null)
+            if [ -n "$ERROR_MSG" ]; then
+                echo -e "${YELLOW}     ⚠️  Warning during disable: $ERROR_MSG${NC}"
+            else
+                echo -e "${GREEN}     ✓ Disabled${NC}"
+            fi
+            
+            # Wait for state change to propagate
+            sleep 2
+            
+            # Now delete the gateway
+            echo -e "${YELLOW}     - Deleting...${NC}"
+            DELETE_RESPONSE=$(curl -s -k -X POST "${BASE_URL}/api/v1/gateway/delete" \
+                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"common\":{\"acctName\":\"$ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"Valtix-2022\"},\"name\":\"$gateway_name\"}" 2>&1)
+            
+            # Check if delete was successful
+            ERROR_MSG=$(echo "$DELETE_RESPONSE" | jq -r '.error // empty' 2>/dev/null)
+            if [ -n "$ERROR_MSG" ]; then
+                echo -e "${RED}     ⚠️  Error deleting: $ERROR_MSG${NC}"
+            else
+                echo -e "${GREEN}     ✓ Deleted${NC}"
+            fi
+        fi
+    done
     
-    DELETE_RESPONSE=$(curl -s -X POST "${BASE_URL}/api/v1/services/gwlb/gateway/delete" \
-        -H "Authorization: Bearer $ACCESS_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{\"common\":{\"acctName\":\"$ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"CiscoMCD-2024\"},\"id\":$GATEWAY_ID}" 2>&1)
-    
-    # Check if delete was successful
-    ERROR_MSG=$(echo "$DELETE_RESPONSE" | jq -r '.error // empty' 2>/dev/null)
-    if [ -n "$ERROR_MSG" ]; then
-        echo -e "${RED}   ⚠️  Error deleting gateway: $ERROR_MSG${NC}"
-        return 1
-    fi
-    
-    echo -e "${GREEN}   ✓ Gateway deleted${NC}"
+    echo -e "${BLUE}   ℹ️  AWS will automatically terminate gateway EC2 instances${NC}"
     return 0
 }
 
@@ -264,12 +289,46 @@ echo ""
 get_access_token
 
 # Delete resources in the correct order (dependencies matter!)
+
+# Step 0: Remove MCD resources from Terraform state first
+echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${YELLOW}Step 0: Removing MCD Resources from Terraform State${NC}"
+echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+# Check if we're in the cleanup directory and cd to parent if needed
+if [ -f "../terraform.tfstate" ] || [ -f "../terraform.tfstate.d" ]; then
+    echo -e "${BLUE}   ℹ️  Found Terraform state in parent directory${NC}"
+    cd ..
+    
+    # List MCD resources in state
+    MCD_RESOURCES=$(terraform state list 2>/dev/null | grep -E "ciscomcd|mcd" || echo "")
+    
+    if [ -n "$MCD_RESOURCES" ]; then
+        echo -e "${YELLOW}   • Found MCD resources in state:${NC}"
+        echo "$MCD_RESOURCES" | while IFS= read -r resource; do
+            if [ -n "$resource" ]; then
+                echo "     - $resource"
+                terraform state rm "$resource" > /dev/null 2>&1 && \
+                    echo -e "${GREEN}       ✓ Removed from state${NC}" || \
+                    echo -e "${YELLOW}       ⚠️  Could not remove${NC}"
+            fi
+        done
+    else
+        echo -e "${BLUE}   ℹ️  No MCD resources found in Terraform state${NC}"
+    fi
+    
+    cd cleanup
+else
+    echo -e "${BLUE}   ℹ️  No Terraform state found (may be running from different directory)${NC}"
+fi
+echo ""
+
 # 1. Delete Gateways first (they depend on Service VPC)
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${YELLOW}Step 1: Deleting Gateways${NC}"
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-delete_gateway "pod${POD_NUMBER}-ingress-gw" "ingress" || true
-delete_gateway "pod${POD_NUMBER}-egress-gw" "egress" || true
+delete_gateway "ingress" || true
+delete_gateway "egress" || true
 echo ""
 
 # 2. Delete Policy Rule Sets (they may reference other objects)

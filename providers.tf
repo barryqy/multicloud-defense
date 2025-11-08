@@ -24,12 +24,12 @@ terraform {
 locals {
   _cred_dir = "${path.root}/.terraform"
   _aws_key_file = "${local._cred_dir}/.aws-secret.key"
-  _mcd_api_file = abspath("${local._cred_dir}/.mcd-api.json")
-  _mcd_json_content = fileexists(local._mcd_api_file) ? file(local._mcd_api_file) : ""
+  _mcd_api_file = "${local._cred_dir}/.mcd-api.json"
 }
 
 provider "ciscomcd" {
-  api_key_file = file("${path.root}/.terraform/.mcd-api.json")
+  # Decode base64-encoded FULL MCD API key JSON
+  api_key_file = base64decode(file(local._mcd_api_file))
 }
 
 provider "aws" {

@@ -49,6 +49,21 @@ fi
 echo -e "${GREEN}✓ Pod Number: ${POD_NUMBER}${NC}"
 echo ""
 
+# Source AWS credentials if available
+if [ -f ".terraform/.aws-secret.key" ]; then
+    export AWS_SECRET_ACCESS_KEY=$(cat .terraform/.aws-secret.key)
+fi
+if [ -f "terraform.tfvars" ]; then
+    AWS_KEY=$(grep -E '^aws_access_key' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
+    if [ -n "$AWS_KEY" ]; then
+        export AWS_ACCESS_KEY_ID="$AWS_KEY"
+    fi
+fi
+
+# Track issues for diagnostics
+DIAGNOSTIC_ISSUES=0
+DIAGNOSTIC_WARNINGS=0
+
 # Source environment helper for IP addresses
 if [ -f "env-helper.sh" ]; then
     source ./env-helper.sh
@@ -484,5 +499,165 @@ echo "  ✅ 1 DLP Profile (SSN Protection)"
 echo ""
 
 echo -e "${BLUE}📖 For more details, check the MCD Console at https://defense.cisco.com${NC}"
+echo ""
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# DIAGNOSTIC HEALTH CHECKS
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}🔍 DIAGNOSTIC HEALTH CHECKS${NC}"
+echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+# Check 1: AWS Infrastructure
+echo -e "${YELLOW}1️⃣  Checking AWS Infrastructure...${NC}"
+VPC_COUNT=$(aws ec2 describe-vpcs --region us-east-1 --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" --query "Vpcs[].VpcId" --output text 2>/dev/null | wc -w | tr -d ' ')
+INSTANCE_COUNT=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*,ciscomcd-pod${POD_NUMBER}-*" "Name=instance-state-name,Values=running" --query "Reservations[].Instances[].InstanceId" --output text 2>/dev/null | wc -w | tr -d ' ')
+TGW_ATT_COUNT=$(aws ec2 describe-transit-gateway-attachments --region us-east-1 --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" "Name=state,Values=available" --query "TransitGatewayAttachments[].TransitGatewayAttachmentId" --output text 2>/dev/null | wc -w | tr -d ' ')
+
+if [ "$VPC_COUNT" -eq 4 ]; then
+    echo -e "  ${GREEN}✓ VPCs: 4/4 found${NC}"
+else
+    echo -e "  ${RED}✗ VPCs: $VPC_COUNT/4 found (Expected: App1, App2, Management, Service)${NC}"
+    DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+fi
+
+if [ "$INSTANCE_COUNT" -eq 5 ]; then
+    echo -e "  ${GREEN}✓ Instances: 5/5 running${NC}"
+else
+    echo -e "  ${YELLOW}⚠️  Instances: $INSTANCE_COUNT/5 running (Expected: App1, App2, Jumpbox, 2 Gateways)${NC}"
+    DIAGNOSTIC_WARNINGS=$((DIAGNOSTIC_WARNINGS + 1))
+fi
+
+if [ "$TGW_ATT_COUNT" -eq 4 ]; then
+    echo -e "  ${GREEN}✓ TGW Attachments: 4/4 available${NC}"
+else
+    echo -e "  ${RED}✗ TGW Attachments: $TGW_ATT_COUNT/4 available${NC}"
+    DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+fi
+echo ""
+
+# Check 2: Critical Routing (Service VPC Datapath)
+echo -e "${YELLOW}2️⃣  Checking Critical Routing Configuration...${NC}"
+SVPC_AWS_ID=$(aws ec2 describe-vpcs --region us-east-1 --filters "Name=tag:Name,Values=pod${POD_NUMBER}-svpc-aws" --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
+
+if [ -n "$SVPC_AWS_ID" ] && [ "$SVPC_AWS_ID" != "None" ]; then
+    DATAPATH_RT=$(aws ec2 describe-route-tables --region us-east-1 --filters "Name=vpc-id,Values=$SVPC_AWS_ID" "Name=tag:Name,Values=*datapath*" --query "RouteTables[0].RouteTableId" --output text 2>/dev/null)
+    
+    if [ -n "$DATAPATH_RT" ] && [ "$DATAPATH_RT" != "None" ]; then
+        APP1_ROUTE=$(aws ec2 describe-route-tables --region us-east-1 --route-table-ids $DATAPATH_RT --query "RouteTables[0].Routes[?DestinationCidrBlock=='10.${POD_NUMBER}.0.0/16'].State" --output text 2>/dev/null)
+        APP2_ROUTE=$(aws ec2 describe-route-tables --region us-east-1 --route-table-ids $DATAPATH_RT --query "RouteTables[0].Routes[?DestinationCidrBlock=='10.$((100 + POD_NUMBER)).0.0/16'].State" --output text 2>/dev/null)
+        
+        if [ "$APP1_ROUTE" = "active" ]; then
+            echo -e "  ${GREEN}✓ Service VPC → App1 VPC route: active${NC}"
+        else
+            echo -e "  ${RED}✗ CRITICAL: Missing route from Service VPC to App1 VPC${NC}"
+            echo -e "  ${YELLOW}    Impact: Ingress gateway CANNOT reach App1 backend${NC}"
+            echo -e "  ${YELLOW}    Fix: aws ec2 create-route --region us-east-1 --route-table-id $DATAPATH_RT --destination-cidr-block 10.${POD_NUMBER}.0.0/16 --transit-gateway-id tgw-0a878e2f5870e2ccf${NC}"
+            DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+        fi
+        
+        if [ "$APP2_ROUTE" = "active" ]; then
+            echo -e "  ${GREEN}✓ Service VPC → App2 VPC route: active${NC}"
+        else
+            echo -e "  ${RED}✗ CRITICAL: Missing route from Service VPC to App2 VPC${NC}"
+            echo -e "  ${YELLOW}    Impact: Ingress gateway CANNOT reach App2 backend${NC}"
+            echo -e "  ${YELLOW}    Fix: aws ec2 create-route --region us-east-1 --route-table-id $DATAPATH_RT --destination-cidr-block 10.$((100 + POD_NUMBER)).0.0/16 --transit-gateway-id tgw-0a878e2f5870e2ccf${NC}"
+            DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+        fi
+    else
+        echo -e "  ${RED}✗ Service VPC datapath route table not found${NC}"
+        DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+    fi
+fi
+echo ""
+
+# Check 3: Gateway Health
+echo -e "${YELLOW}3️⃣  Checking MCD Gateway Health...${NC}"
+INGRESS_GW_IP=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=ciscomcd-pod${POD_NUMBER}-ingress-gw-aws-*" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].PublicIpAddress" --output text 2>/dev/null)
+EGRESS_GW_IP=$(aws ec2 describe-instances --region us-east-1 --filters "Name=tag:Name,Values=ciscomcd-pod${POD_NUMBER}-egress-gw-aws-*" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].PublicIpAddress" --output text 2>/dev/null)
+
+if [ -n "$INGRESS_GW_IP" ] && [ "$INGRESS_GW_IP" != "None" ]; then
+    echo -e "  ${GREEN}✓ Ingress Gateway: Running ($INGRESS_GW_IP)${NC}"
+else
+    echo -e "  ${RED}✗ Ingress Gateway: NOT running${NC}"
+    DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+fi
+
+if [ -n "$EGRESS_GW_IP" ] && [ "$EGRESS_GW_IP" != "None" ]; then
+    echo -e "  ${GREEN}✓ Egress Gateway: Running ($EGRESS_GW_IP)${NC}"
+else
+    echo -e "  ${RED}✗ Egress Gateway: NOT running${NC}"
+    DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+fi
+echo ""
+
+# Check 4: Functional Connectivity
+echo -e "${YELLOW}4️⃣  Testing Functional Connectivity...${NC}"
+if [ -n "$INGRESS_GW_IP" ] && [ "$INGRESS_GW_IP" != "None" ]; then
+    # Test App1
+    HTTP_TEST_APP1=$(curl -s -m 5 "http://$INGRESS_GW_IP/" 2>&1)
+    if echo "$HTTP_TEST_APP1" | grep -q "Application 1"; then
+        echo -e "  ${GREEN}✓ App1 HTTP via Ingress Gateway: Working${NC}"
+    else
+        echo -e "  ${RED}✗ App1 HTTP via Ingress Gateway: NOT working${NC}"
+        echo -e "  ${YELLOW}    Check Service VPC datapath routes above${NC}"
+        DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+    fi
+    
+    # Test App2
+    HTTP_TEST_APP2=$(curl -s -m 5 "http://$INGRESS_GW_IP:8080/" 2>&1)
+    if echo "$HTTP_TEST_APP2" | grep -q "Application 2"; then
+        echo -e "  ${GREEN}✓ App2 HTTP via Ingress Gateway (port 8080): Working${NC}"
+    else
+        echo -e "  ${RED}✗ App2 HTTP via Ingress Gateway (port 8080): NOT working${NC}"
+        DIAGNOSTIC_ISSUES=$((DIAGNOSTIC_ISSUES + 1))
+    fi
+else
+    echo -e "  ${YELLOW}⚠️  Cannot test HTTP - Ingress gateway not running${NC}"
+fi
+echo ""
+
+# Diagnostic Summary
+echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}📊 DIAGNOSTIC SUMMARY${NC}"
+echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+if [ $DIAGNOSTIC_ISSUES -eq 0 ] && [ $DIAGNOSTIC_WARNINGS -eq 0 ]; then
+    echo -e "${GREEN}✅ ALL CHECKS PASSED - Lab is fully functional!${NC}"
+    echo ""
+    echo "Your lab environment is working correctly. You can:"
+    echo "  • Access apps via ingress gateway"
+    echo "  • SSH from jumpbox to app instances"
+    echo "  • Test DLP and IPS policies"
+    echo "  • View traffic in MCD Console"
+else
+    if [ $DIAGNOSTIC_ISSUES -gt 0 ]; then
+        echo -e "${RED}❌ FOUND $DIAGNOSTIC_ISSUES CRITICAL ISSUE(S)${NC}"
+        echo ""
+        echo "⚠️  Your lab has issues that need to be fixed."
+        echo "Review the diagnostics above for specific problems and solutions."
+        echo ""
+        echo "Common fixes:"
+        echo "  1. Missing routes: Run the AWS CLI commands shown above"
+        echo "  2. Missing gateways: Re-run ./3-secure.sh"
+        echo "  3. Missing TGW attachments: Re-run ./5-attach-tgw.sh"
+        echo ""
+    fi
+    
+    if [ $DIAGNOSTIC_WARNINGS -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  FOUND $DIAGNOSTIC_WARNINGS WARNING(S)${NC}"
+        echo ""
+        echo "Some components may still be initializing."
+        echo "Wait 2-3 minutes and run this script again."
+        echo ""
+    fi
+fi
+
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}💡 Tip: Run this script anytime to check your lab status and diagnose issues${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 

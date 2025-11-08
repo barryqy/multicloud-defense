@@ -112,15 +112,16 @@ resource "aws_route_table" "mgmt_rt" {
 
 # Route for Management VPC to reach App VPCs via TGW
 # This route is only created after TGW attachments exist (from 5-attach-tgw.sh)
-resource "aws_route" "mgmt_to_tgw" {
-  count                  = fileexists("${path.module}/tgw-attachments.tf") ? 1 : 0
-  route_table_id         = aws_route_table.mgmt_rt.id
-  destination_cidr_block = "10.0.0.0/8"
-  transit_gateway_id     = data.aws_ec2_transit_gateway.tgw.id
-  
-  # Note: No depends_on needed - the fileexists() check ensures TGW attachments exist
-  # The route is only created when tgw-attachments.tf exists (after 5-attach-tgw.sh)
-}
+# Commented out - this route is created by 5-attach-tgw.sh
+# resource "aws_route" "mgmt_to_tgw" {
+#   count                  = fileexists("${path.module}/tgw-attachments.tf") ? 1 : 0
+#   route_table_id         = aws_route_table.mgmt_rt.id
+#   destination_cidr_block = "10.0.0.0/8"
+#   transit_gateway_id     = data.aws_ec2_transit_gateway.tgw.id
+#   
+#   # Note: No depends_on needed - the fileexists() check ensures TGW attachments exist
+#   # The route is only created when tgw-attachments.tf exists (after 5-attach-tgw.sh)
+# }
 
 resource "aws_route_table_association" "mgmt_rt_assoc" {
   subnet_id      = aws_subnet.mgmt_subnet.id
@@ -388,14 +389,15 @@ resource "aws_eip_association" "app-eip-assocation" {
 
 resource "aws_security_group" "allow_all" {
   count  = 2
-  name   = "pod${var.pod_number}-app${count.index + 1}-sg"
+  name   = "pod${var.pod_number}-app${count.index + 1}-vpc-sg"
   vpc_id = aws_vpc.app_vpc["${count.index}"].id
 
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0", "68.154.48.186/32", "10.0.0.0/8", "192.0.0.0/8"]
+    # Allow traffic from RFC1918 private IP ranges (internal AWS traffic only)
+    cidr_blocks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
   }
   egress {
     from_port   = 0
