@@ -133,92 +133,39 @@ else
 fi
 echo ""
 
-# STEP 2: DETERMINE ACTION
-echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-echo -e "${CYAN}Step 2: Determining Required Action${NC}"
-echo -e "${CYAN}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-echo ""
-
+# Simplified status check - just proceed with deployment if needed
 NEEDS_DEPLOYMENT=0
-ACTION_DESCRIPTION=""
 
-# Scenario 1: Gateways don't exist at all
+# Check if gateways exist
 if [ "$EGRESS_EXISTS" -eq 0 ] || [ "$INGRESS_EXISTS" -eq 0 ]; then
     NEEDS_DEPLOYMENT=1
-    ACTION_DESCRIPTION="Initial gateway deployment"
-    echo -e "${YELLOW}⚠️  Gateways not found in Terraform state${NC}"
-    echo ""
-    echo "This appears to be the first time deploying gateways."
-    echo "The script will create both Egress and Ingress gateways."
-    echo ""
-
-# Scenario 2: Gateways are tainted (failed deployment)
 elif [ "$EGRESS_TAINTED" -eq 1 ] || [ "$INGRESS_TAINTED" -eq 1 ]; then
     NEEDS_DEPLOYMENT=1
-    ACTION_DESCRIPTION="Gateway recovery (untaint and redeploy)"
-    echo -e "${RED}⚠️  Gateway resources are TAINTED${NC}"
-    echo ""
-    echo "This means a previous deployment failed partway through."
-    echo "The script will untaint and redeploy the gateways."
-    echo ""
-
-# Scenario 3: Gateways exist but no EC2 instances
 elif [ "$INSTANCE_COUNT" -eq 0 ]; then
     NEEDS_DEPLOYMENT=1
-    ACTION_DESCRIPTION="Gateway EC2 instance deployment"
-    echo -e "${RED}⚠️  Gateway resources exist but NO EC2 instances running${NC}"
-    echo ""
-    echo "The gateways exist in MCD control plane but have no EC2 instances."
-    echo "This means traffic cannot be inspected."
-    echo "The script will trigger deployment of the gateway EC2 instances."
-    echo ""
+fi
 
-# Scenario 4: Everything looks good
-else
-    NEEDS_DEPLOYMENT=0
-    ACTION_DESCRIPTION="No action needed"
-    echo -e "${GREEN}✅ Gateways are properly deployed!${NC}"
+# If everything is already deployed, exit gracefully
+if [ "$NEEDS_DEPLOYMENT" -eq 0 ]; then
+    echo -e "${GREEN}✅ Gateways are already deployed and running!${NC}"
     echo ""
-    echo "  • Gateway resources exist in Terraform ✓"
-    echo "  • $INSTANCE_COUNT EC2 instances running in AWS ✓"
-    echo "  • Gateways are ready to inspect traffic ✓"
+    echo "Gateway EC2 instances ($INSTANCE_COUNT) are running in Service VPC."
     echo ""
-    echo -e "${BLUE}What's Next?${NC}"
-    echo ""
-    echo "Run: ./attach-tgw.sh"
-    echo ""
-    echo "This will route traffic through the Transit Gateway and enable"
-    echo "DLP, IPS, and WAF protection for your applications."
+    echo -e "${BLUE}Next step: Run ./5-attach-tgw.sh to enable traffic inspection${NC}"
     echo ""
     exit 0
 fi
 
-# STEP 3: CONFIRMATION
-echo -e "${YELLOW}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}Action Required: $ACTION_DESCRIPTION${NC}"
-echo -e "${YELLOW}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+# Otherwise, proceed with deployment
+echo -e "${YELLOW}Deploying gateway EC2 instances...${NC}"
+echo ""
+echo "This will take approximately 10-15 minutes."
 echo ""
 
-echo "This deployment will:"
-echo "  1. Deploy/update Egress Gateway (for outbound traffic inspection)"
-echo "  2. Deploy/update Ingress Gateway (for inbound traffic protection)"
-echo "  3. Create gateway EC2 instances (m5.large) in Service VPC"
-echo "  4. Configure policies for DLP, IPS, and WAF"
-echo ""
-echo "Expected timeline: 10-15 minutes"
-echo ""
-
-read -p "Continue with gateway deployment? (yes/no): " CONFIRM
-
-if [ "$CONFIRM" != "yes" ]; then
-    echo -e "${YELLOW}⚠️  Gateway deployment cancelled${NC}"
-    exit 0
-fi
-
-# STEP 4: DEPLOYMENT
+# STEP 2: DEPLOYMENT
 echo ""
 echo -e "${BLUE}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 3: Deploying Multicloud Defense Gateways${NC}"
+echo -e "${BLUE}Step 2: Deploying Multicloud Defense Gateways${NC}"
 echo -e "${BLUE}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
 echo ""
 

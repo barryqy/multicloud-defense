@@ -747,6 +747,69 @@ echo ""
         fi
     fi
     echo ""
+    
+    # ════════════════════════════════════════════════════════════════════════════════════════════════
+    # CRITICAL FIX: Directly replace IGW routes with TGW routes using AWS CLI
+    # ════════════════════════════════════════════════════════════════════════════════════════════════
+    # The Terraform approach above may not work if routes aren't defined correctly.
+    # This is a direct AWS CLI fallback to ensure routes are updated.
+    # ════════════════════════════════════════════════════════════════════════════════════════════════
+    
+    echo -e "${YELLOW}Replacing App VPC default routes (IGW → TGW)...${NC}"
+    echo ""
+    
+    # Get App1 and App2 route table IDs
+    APP1_RT_ID=$(aws ec2 describe-route-tables --region us-east-1 \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app1-rt" \
+        --query "RouteTables[0].RouteTableId" \
+        --output text 2>/dev/null)
+    
+    APP2_RT_ID=$(aws ec2 describe-route-tables --region us-east-1 \
+        --filters "Name=tag:Name,Values=pod${POD_NUMBER}-app2-rt" \
+        --query "RouteTables[0].RouteTableId" \
+        --output text 2>/dev/null)
+    
+    if [ -n "$APP1_RT_ID" ] && [ "$APP1_RT_ID" != "None" ]; then
+        echo "Updating App1 VPC default route:"
+        echo "  Route Table: $APP1_RT_ID"
+        echo "  From: 0.0.0.0/0 → IGW"
+        echo "  To:   0.0.0.0/0 → TGW"
+        
+        # Replace the default route
+        aws ec2 replace-route --region us-east-1 \
+            --route-table-id "$APP1_RT_ID" \
+            --destination-cidr-block 0.0.0.0/0 \
+            --transit-gateway-id "$TGW_ID" 2>&1
+        
+        if [ $? -eq 0 ]; then
+            echo -e "  ${GREEN}✓ App1 default route updated to TGW${NC}"
+        else
+            echo -e "  ${RED}✗ Failed to update App1 default route${NC}"
+        fi
+        echo ""
+    fi
+    
+    if [ -n "$APP2_RT_ID" ] && [ "$APP2_RT_ID" != "None" ]; then
+        echo "Updating App2 VPC default route:"
+        echo "  Route Table: $APP2_RT_ID"
+        echo "  From: 0.0.0.0/0 → IGW"
+        echo "  To:   0.0.0.0/0 → TGW"
+        
+        # Replace the default route
+        aws ec2 replace-route --region us-east-1 \
+            --route-table-id "$APP2_RT_ID" \
+            --destination-cidr-block 0.0.0.0/0 \
+            --transit-gateway-id "$TGW_ID" 2>&1
+        
+        if [ $? -eq 0 ]; then
+            echo -e "  ${GREEN}✓ App2 default route updated to TGW${NC}"
+        else
+            echo -e "  ${RED}✗ Failed to update App2 default route${NC}"
+        fi
+        echo ""
+    fi
+    
+    echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}✅ Transit Gateway Attachment Complete!${NC}"
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"

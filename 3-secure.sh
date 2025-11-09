@@ -269,13 +269,34 @@ fi
 echo ""
 echo -e "${YELLOW}🚀 Deploying security configuration...${NC}"
 echo ""
-echo "This will take approximately 10-15 minutes..."
-echo "Progress updates will appear below:"
+echo -e "${BLUE}Deployment Timeline (watch for these milestones):${NC}"
+echo "  → [~2 min] Creating Service VPC and networking"
+echo "  → [~5 min] Deploying address and service objects"
+echo "  → [~8 min] Creating DLP profiles"
+echo "  → [~12 min] Deploying policy rule sets"
+echo "  → [~15 min] Launching security gateways"
+echo ""
+echo -e "${YELLOW}💡 Tip: Watch for 'Creation complete' messages below${NC}"
 echo ""
 
-# Apply the plan
-APPLY_OUTPUT=$(terraform apply -auto-approve security-tfplan 2>&1 | sanitize_output)
-APPLY_STATUS=$?
+# Apply the plan with real-time output
+terraform apply -auto-approve security-tfplan 2>&1 | tee /tmp/mcd-secure-apply.log | while IFS= read -r line; do
+    # Show creation/modification lines, hide sensitive info
+    if echo "$line" | grep -qE "(Creating|Modifying|Creation complete|Still creating)"; then
+        echo "$line"
+    elif echo "$line" | grep -qE "^Apply complete"; then
+        echo "$line"
+    elif echo "$line" | grep -qiE "error"; then
+        echo "$line"
+    fi
+done
+
+APPLY_STATUS=${PIPESTATUS[0]}
+APPLY_OUTPUT=$(cat /tmp/mcd-secure-apply.log 2>/dev/null || echo "")
+rm -f /tmp/mcd-secure-apply.log
+
+echo ""
+echo -e "${BLUE}🔍 Verifying security deployment...${NC}"
 
 # Check for "already exists" errors
 ONLY_EXISTS_ERRORS=false

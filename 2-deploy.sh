@@ -553,6 +553,7 @@ if [ $APPLY_STATUS -eq 0 ]; then
     echo ""
     
     # Check for tainted resources (provisioner failures)
+    echo -e "${BLUE}🔍 Verifying deployment integrity...${NC}"
     TAINTED_RESOURCES=$(terraform state list 2>/dev/null | while read resource; do
         terraform state show "$resource" 2>/dev/null | grep -q "Tainted: true" && echo "$resource"
     done)
@@ -604,14 +605,19 @@ if [ $APPLY_STATUS -eq 0 ]; then
             echo "These may need manual attention. Contact instructor if unsure."
             echo ""
         fi
+    else
+        echo -e "${GREEN}✓ All resources are clean (no tainted resources)${NC}"
+        echo ""
     fi
     
     echo "Your Multicloud Defense lab environment is now ready."
     echo ""
     
     # Export environment variables using helper
+    echo -e "${BLUE}📝 Gathering deployment information...${NC}"
     source ./env-helper.sh
     export_deployment_vars
+    echo ""
     
     echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
     echo -e "${BLUE}📡 Server Information${NC}"
