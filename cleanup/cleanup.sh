@@ -1,11 +1,16 @@
 #!/bin/bash
 
 # ════════════════════════════════════════════════════════════
-# Unified Cleanup Script - Pod Resources (v3.0)
+# Unified Cleanup Script - Pod Resources (v3.1)
 # ════════════════════════════════════════════════════════════
 # This script cleans up ALL resources for a given pod:
-#   • MCD resources (gateways, policies, Service VPC)
+#   • MCD resources (policies, DLP profiles, gateways, Service VPC)
 #   • AWS resources (instances, VPCs, TGW attachments, etc.)
+#
+# Version 3.1 Updates:
+#   ✓ DLP profile cleanup (with proper Bearer token auth)
+#   ✓ Policy rule set cleanup (deleted before DLP to avoid errors)
+#   ✓ Correct dependency order: Policies → DLP → Gateways
 #
 # Version 3.0 Updates:
 #   ✓ Uses correct system AWS CLI path
@@ -30,7 +35,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo "╔════════════════════════════════════════════════════════════╗"
-echo "║      Unified Pod Cleanup v3.0 - State Independent        ║"
+echo "║      Unified Pod Cleanup v3.1 - State Independent        ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
 
