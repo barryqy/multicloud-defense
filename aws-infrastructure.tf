@@ -245,6 +245,9 @@ resource "aws_instance" "jumpbox" {
   # Use cloud-init to configure jumpbox (faster and more reliable than SSH provisioners)
   user_data = <<-EOF
               #!/bin/bash
+              set -x  # Debug mode
+              exec > >(tee /var/log/user-data.log) 2>&1
+              
               # Setup SSH key for accessing app instances
               mkdir -p /home/ubuntu/.ssh
               cat > /home/ubuntu/.ssh/id_rsa <<'SSHKEY'
@@ -254,8 +257,32 @@ SSHKEY
               chown ubuntu:ubuntu /home/ubuntu/.ssh/id_rsa
               
               # Add app instances to /etc/hosts for easy access
+              # Remove old entries if they exist
+              sed -i '/app1$/d' /etc/hosts
+              sed -i '/app2$/d' /etc/hosts
+              
+              # Add new entries
               echo '${local.app1_nic[0]} app1' >> /etc/hosts
               echo '${local.app2_nic[0]} app2' >> /etc/hosts
+              
+              # Verify entries were added
+              echo "=== /etc/hosts entries added ===" >> /var/log/user-data.log
+              grep 'app[12]' /etc/hosts >> /var/log/user-data.log
+              
+              # Also add to ubuntu user's local hosts file for reference
+              cat >> /home/ubuntu/app-hosts.txt <<'HOSTINFO'
+App1 Private IP: ${local.app1_nic[0]}
+App2 Private IP: ${local.app2_nic[0]}
+
+Quick access commands:
+  ssh app1
+  curl http://app1
+  ssh app2  
+  curl http://app2
+HOSTINFO
+              chown ubuntu:ubuntu /home/ubuntu/app-hosts.txt
+              
+              echo "=== Jumpbox configuration complete ===" >> /var/log/user-data.log
               EOF
 
   # Ensure keypair and networking are ready
@@ -320,19 +347,40 @@ resource "aws_security_group" "allow_all" {
   name   = "pod${var.pod_number}-app${count.index + 1}-vpc-sg"
   vpc_id = aws_vpc.app_vpc["${count.index}"].id
 
+  # Allow HTTP from internet (for testing immediately after deploy.sh)
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow HTTP from Internet"
+  }
+
+  # Allow SSH from internet (for troubleshooting)
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow SSH from Internet"
+  }
+
+  # Allow all traffic from RFC1918 private IP ranges (internal AWS traffic)
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    # Allow traffic from RFC1918 private IP ranges (internal AWS traffic only)
     cidr_blocks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+    description = "Allow all internal traffic"
   }
+
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   tags = {
     Name = "pod${var.pod_number}-app${count.index + 1}-sg"
   }

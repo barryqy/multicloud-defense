@@ -80,11 +80,88 @@ fi
 
 echo ""
 
-# Import existing MCD resources (for container environments where state is lost)
-echo -e "${YELLOW}🔍 Checking for existing MCD resources...${NC}"
+# ════════════════════════════════════════════════════════════
+# Validate Terraform State (detect state drift)
+# ════════════════════════════════════════════════════════════
+# In container environments, Terraform state can get out of sync
+# with the actual MCD backend. This validates and auto-fixes it.
+# ════════════════════════════════════════════════════════════
+
+echo -e "${YELLOW}🔍 Validating Terraform state...${NC}"
 echo ""
 
-# Function to silently import resources
+# Check if MCD credentials exist to query API
+MCD_CREDS_FILE=".terraform/.mcd-api.json"
+STATE_CLEANED=0
+
+if [ -f "$MCD_CREDS_FILE" ] && [ -f ".terraform/terraform.tfstate" ]; then
+    # Check for stale MCD resources in state
+    STALE_RESOURCES=$(terraform state list 2>/dev/null | grep "^ciscomcd_" || true)
+    
+    if [ -n "$STALE_RESOURCES" ]; then
+        echo -e "${YELLOW}   Found MCD resources in state, verifying with MCD API...${NC}"
+        
+        # Quick API check to see if any MCD resources exist for this pod
+        DECODED=$(cat "$MCD_CREDS_FILE" | base64 -d 2>/dev/null)
+        API_KEY=$(echo "$DECODED" | jq -r '.apiKeyID' 2>/dev/null)
+        API_SECRET=$(echo "$DECODED" | jq -r '.apiKeySecret' 2>/dev/null)
+        REST_API_SERVER=$(echo "$DECODED" | jq -r '.restAPIServer' 2>/dev/null)
+        ACCT_NAME=$(echo "$DECODED" | jq -r '.acctName' 2>/dev/null)
+        BASE_URL="https://${REST_API_SERVER}"
+        
+        if [ -n "$API_KEY" ] && [ "$API_KEY" != "null" ]; then
+            TOKEN_RESPONSE=$(curl -s -X POST "${BASE_URL}/api/v1/user/gettoken" \
+                -H "Content-Type: application/json" \
+                -d "{\"common\":{\"acctName\":\"$ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"CiscoMCD-2024\"},\"apiKeyID\":\"$API_KEY\",\"apiKeySecret\":\"$API_SECRET\"}" 2>/dev/null)
+            
+            ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.accessToken' 2>/dev/null)
+            
+            if [ -n "$ACCESS_TOKEN" ] && [ "$ACCESS_TOKEN" != "null" ]; then
+                # Check if DLP profile exists
+                DLP_RESPONSE=$(curl -s -X POST "${BASE_URL}/api/v1/services/dlp/profile/list" \
+                    -H "Authorization: Bearer $ACCESS_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"common\":{\"acctName\":\"$ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"CiscoMCD-2024\"}}" 2>/dev/null)
+                
+                DLP_EXISTS=$(echo "$DLP_RESPONSE" | jq -r ".profiles[]? | select(.name == \"pod${POD_NUMBER}-block-ssn\") | .id" 2>/dev/null)
+                
+                # If state has resources but MCD doesn't, clean state
+                if [ -z "$DLP_EXISTS" ] || [ "$DLP_EXISTS" == "null" ]; then
+                    echo -e "${YELLOW}   ⚠️  State drift detected: Resources in state but not in MCD${NC}"
+                    echo -e "${YELLOW}   🧹 Cleaning stale state entries...${NC}"
+                    
+                    # Remove stale MCD resources from state
+                    terraform state rm 'ciscomcd_profile_dlp.block-ssn-dlp' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_service_vpc.svpc-aws' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_policy_rule_set.egress_policy' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_policy_rule_set.ingress_policy' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_policy_rules.egress-ew-policy-rules' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_policy_rules.ingress-policy-rules' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_address_object.app1-egress-addr-object' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_address_object.app2-egress-addr-object' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_address_object.app1-ingress-addr-object' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_address_object.app2-ingress-addr-object' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_service_object.app1_svc_http' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    terraform state rm 'ciscomcd_service_object.app2_svc_http' 2>/dev/null && ((STATE_CLEANED++)) || true
+                    
+                    if [ $STATE_CLEANED -gt 0 ]; then
+                        echo -e "${GREEN}   ✓ Cleaned $STATE_CLEANED stale state entries${NC}"
+                    fi
+                else
+                    echo -e "${GREEN}   ✓ State is in sync with MCD backend${NC}"
+                fi
+            fi
+        fi
+    else
+        echo -e "${GREEN}   ✓ No MCD resources in state (fresh deployment)${NC}"
+    fi
+else
+    echo -e "${BLUE}   ℹ️  Skipping state validation (fresh init or no MCD credentials)${NC}"
+fi
+
+echo ""
+
+# Function to silently import resources (will be called after terraform init)
 silent_import() {
     local resource_type=$1
     local resource_name=$2
@@ -99,69 +176,6 @@ silent_import() {
     terraform import "${resource_type}.${resource_name}" "${resource_id}" > /dev/null 2>&1
     return $?
 }
-
-IMPORTED_COUNT=0
-
-# Try to import MCD resources that might already exist
-echo -n "  • Service VPC... "
-if silent_import "ciscomcd_service_vpc" "svpc-aws" "pod${POD_NUMBER}-svpc-aws"; then
-    echo -e "${GREEN}✓ imported${NC}"
-    ((IMPORTED_COUNT++))
-else
-    echo -e "${BLUE}new${NC}"
-fi
-
-echo -n "  • DLP Profile... "
-if silent_import "ciscomcd_profile_dlp" "block-ssn-dlp" "pod${POD_NUMBER}-block-ssn"; then
-    echo -e "${GREEN}✓ imported${NC}"
-    ((IMPORTED_COUNT++))
-else
-    echo -e "${BLUE}new${NC}"
-fi
-
-echo -n "  • Address Objects... "
-ADDR_IMPORTED=0
-silent_import "ciscomcd_address_object" "app1-egress-addr-object" "pod${POD_NUMBER}-app1-egress" && ((ADDR_IMPORTED++)) || true
-silent_import "ciscomcd_address_object" "app2-egress-addr-object" "pod${POD_NUMBER}-app2-egress" && ((ADDR_IMPORTED++)) || true
-silent_import "ciscomcd_address_object" "app1-ingress-addr-object" "pod${POD_NUMBER}-app1-ingress" && ((ADDR_IMPORTED++)) || true
-silent_import "ciscomcd_address_object" "app2-ingress-addr-object" "pod${POD_NUMBER}-app2-ingress" && ((ADDR_IMPORTED++)) || true
-if [ $ADDR_IMPORTED -gt 0 ]; then
-    echo -e "${GREEN}✓ $ADDR_IMPORTED imported${NC}"
-    IMPORTED_COUNT=$((IMPORTED_COUNT + ADDR_IMPORTED))
-else
-    echo -e "${BLUE}new${NC}"
-fi
-
-echo -n "  • Service Objects... "
-SVC_IMPORTED=0
-silent_import "ciscomcd_service_object" "app1_svc_http" "pod${POD_NUMBER}-app1" && ((SVC_IMPORTED++)) || true
-silent_import "ciscomcd_service_object" "app2_svc_http" "pod${POD_NUMBER}-app2" && ((SVC_IMPORTED++)) || true
-if [ $SVC_IMPORTED -gt 0 ]; then
-    echo -e "${GREEN}✓ $SVC_IMPORTED imported${NC}"
-    IMPORTED_COUNT=$((IMPORTED_COUNT + SVC_IMPORTED))
-else
-    echo -e "${BLUE}new${NC}"
-fi
-
-echo -n "  • Policy Rule Sets... "
-POLICY_IMPORTED=0
-silent_import "ciscomcd_policy_rule_set" "egress_policy" "pod${POD_NUMBER}-egress-policy" && ((POLICY_IMPORTED++)) || true
-silent_import "ciscomcd_policy_rule_set" "ingress_policy" "pod${POD_NUMBER}-ingress-policy" && ((POLICY_IMPORTED++)) || true
-if [ $POLICY_IMPORTED -gt 0 ]; then
-    echo -e "${GREEN}✓ $POLICY_IMPORTED imported${NC}"
-    IMPORTED_COUNT=$((IMPORTED_COUNT + POLICY_IMPORTED))
-else
-    echo -e "${BLUE}new${NC}"
-fi
-
-echo ""
-if [ $IMPORTED_COUNT -gt 0 ]; then
-    echo -e "${GREEN}✓ Imported $IMPORTED_COUNT existing MCD resource(s)${NC}"
-    echo -e "${BLUE}ℹ️  This is normal in container environments where Terraform state is lost${NC}"
-else
-    echo -e "${BLUE}✓ No existing resources found - will create new ones${NC}"
-fi
-echo ""
 
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}🔒 Security Features to Deploy${NC}"
@@ -228,6 +242,75 @@ else
     exit 1
 fi
 
+# ════════════════════════════════════════════════════════════
+# Import existing MCD resources (for container environments)
+# ════════════════════════════════════════════════════════════
+echo ""
+echo -e "${YELLOW}🔍 Checking for existing MCD resources...${NC}"
+echo ""
+
+IMPORTED_COUNT=0
+
+# Try to import MCD resources that might already exist
+echo -n "  • Service VPC... "
+if silent_import "ciscomcd_service_vpc" "svpc-aws" "pod${POD_NUMBER}-svpc-aws"; then
+    echo -e "${GREEN}✓ imported${NC}"
+    ((IMPORTED_COUNT++))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • DLP Profile... "
+if silent_import "ciscomcd_profile_dlp" "block-ssn-dlp" "pod${POD_NUMBER}-block-ssn"; then
+    echo -e "${GREEN}✓ imported${NC}"
+    ((IMPORTED_COUNT++))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • Address Objects... "
+ADDR_IMPORTED=0
+silent_import "ciscomcd_address_object" "app1-egress-addr-object" "pod${POD_NUMBER}-app1-egress" && ((ADDR_IMPORTED++)) || true
+silent_import "ciscomcd_address_object" "app2-egress-addr-object" "pod${POD_NUMBER}-app2-egress" && ((ADDR_IMPORTED++)) || true
+silent_import "ciscomcd_address_object" "app1-ingress-addr-object" "pod${POD_NUMBER}-app1-ingress" && ((ADDR_IMPORTED++)) || true
+silent_import "ciscomcd_address_object" "app2-ingress-addr-object" "pod${POD_NUMBER}-app2-ingress" && ((ADDR_IMPORTED++)) || true
+if [ $ADDR_IMPORTED -gt 0 ]; then
+    echo -e "${GREEN}✓ $ADDR_IMPORTED imported${NC}"
+    IMPORTED_COUNT=$((IMPORTED_COUNT + ADDR_IMPORTED))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • Service Objects... "
+SVC_IMPORTED=0
+silent_import "ciscomcd_service_object" "app1_svc_http" "pod${POD_NUMBER}-app1" && ((SVC_IMPORTED++)) || true
+silent_import "ciscomcd_service_object" "app2_svc_http" "pod${POD_NUMBER}-app2" && ((SVC_IMPORTED++)) || true
+if [ $SVC_IMPORTED -gt 0 ]; then
+    echo -e "${GREEN}✓ $SVC_IMPORTED imported${NC}"
+    IMPORTED_COUNT=$((IMPORTED_COUNT + SVC_IMPORTED))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo -n "  • Policy Rule Sets... "
+POLICY_IMPORTED=0
+silent_import "ciscomcd_policy_rule_set" "egress_policy" "pod${POD_NUMBER}-egress-policy" && ((POLICY_IMPORTED++)) || true
+silent_import "ciscomcd_policy_rule_set" "ingress_policy" "pod${POD_NUMBER}-ingress-policy" && ((POLICY_IMPORTED++)) || true
+if [ $POLICY_IMPORTED -gt 0 ]; then
+    echo -e "${GREEN}✓ $POLICY_IMPORTED imported${NC}"
+    IMPORTED_COUNT=$((IMPORTED_COUNT + POLICY_IMPORTED))
+else
+    echo -e "${BLUE}new${NC}"
+fi
+
+echo ""
+if [ $IMPORTED_COUNT -gt 0 ]; then
+    echo -e "${GREEN}✓ Imported $IMPORTED_COUNT existing MCD resource(s)${NC}"
+    echo -e "${BLUE}ℹ️  This is normal - reusing existing resources${NC}"
+else
+    echo -e "${BLUE}✓ No existing resources found - will create new ones${NC}"
+fi
+
 # Target only the security-related resources
 # Note: Service VPC is deployed in deploy.sh, not here
 SECURITY_TARGETS=(
@@ -280,7 +363,9 @@ echo -e "${YELLOW}💡 Tip: Watch for 'Creation complete' messages below${NC}"
 echo ""
 
 # Apply the plan with real-time output
-terraform apply -auto-approve security-tfplan 2>&1 | tee /tmp/mcd-secure-apply.log | while IFS= read -r line; do
+# NOTE: -parallelism=1 prevents MCD provider race conditions (Nov 10, 2025)
+# To revert: remove -parallelism=1 flag if it causes issues
+terraform apply -parallelism=1 -auto-approve security-tfplan 2>&1 | tee /tmp/mcd-secure-apply.log | while IFS= read -r line; do
     # Show creation/modification lines, hide sensitive info
     if echo "$line" | grep -qE "(Creating|Modifying|Creation complete|Still creating)"; then
         echo "$line"
