@@ -29,7 +29,7 @@ echo "════════════════════════�
 echo "📋 📋 📋  STUDENT POD NUMBER  📋 📋 📋"
 echo "════════════════════════════════════════════════════════════"
 echo ""
-read -p "👉 Enter your student pod number (1-60): " POD_NUMBER
+read -p "👉 Enter your student pod number (1-50): " POD_NUMBER
 echo ""
 
 # Validate pod number

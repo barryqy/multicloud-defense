@@ -128,6 +128,15 @@ resource "ciscomcd_policy_rule_set" "egress_policy" {
 
 resource "ciscomcd_policy_rules" "egress-ew-policy-rules" {
   rule_set_id = ciscomcd_policy_rule_set.egress_policy.id
+  
+  # Ensure dependencies are created first to avoid race conditions
+  depends_on = [
+    ciscomcd_profile_dlp.block-ssn-dlp,
+    ciscomcd_service_vpc.svpc-aws,
+    ciscomcd_address_object.app1-egress-addr-object,
+    ciscomcd_address_object.app2-egress-addr-object
+  ]
+  
   rule {
     name                      = "egress-internet-with-dlp"
     description               = "Egress to internet with IPS and DLP inspection"
@@ -170,6 +179,13 @@ resource "ciscomcd_policy_rule_set" "ingress_policy" {
 
 resource "ciscomcd_policy_rules" "ingress-policy-rules" {
   rule_set_id = ciscomcd_policy_rule_set.ingress_policy.id
+  
+  # Ensure dependencies are created first to avoid race conditions
+  depends_on = [
+    ciscomcd_service_object.app1_svc_http,
+    ciscomcd_service_object.app2_svc_http
+  ]
+  
   rule {
     name                      = "app1-http"
     description               = "App1 HTTP on port 80"
