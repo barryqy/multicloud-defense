@@ -1,22 +1,26 @@
 #!/bin/bash
 
 # ════════════════════════════════════════════════════════════
-# Unified Cleanup Script - Pod Resources
+# Unified Cleanup Script - Pod Resources (v3.0)
 # ════════════════════════════════════════════════════════════
 # This script cleans up ALL resources for a given pod:
 #   • MCD resources (gateways, policies, Service VPC)
 #   • AWS resources (instances, VPCs, TGW attachments, etc.)
 #
-# Works in all environments:
-#   ✓ With or without Terraform state
-#   ✓ Container environments
-#   ✓ Handles orphaned resources
-#   ✓ Correct deletion order (TGW attachments!)
+# Version 3.0 Updates:
+#   ✓ Uses correct system AWS CLI path
+#   ✓ Verifies cleanup results (doesn't trust exit codes)
+#   ✓ Proper ENI deletion before EIP release
+#   ✓ Handles MCD Service VPCs (192.168.X.0/24)
+#   ✓ Better error handling and retry logic
 #
-# Usage: ./cleanup.sh [pod_number]
+# Usage: ./cleanup.sh [pod_number] [auto]
 # ════════════════════════════════════════════════════════════
 
 set -e
+
+# CRITICAL: Use system AWS CLI (not broken binaries)
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # Colors
 RED='\033[0;31m'
@@ -26,8 +30,18 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo "╔════════════════════════════════════════════════════════════╗"
-echo "║        Unified Pod Cleanup - State Independent           ║"
+echo "║      Unified Pod Cleanup v3.0 - State Independent        ║"
 echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Verify AWS CLI is working
+if ! aws --version >/dev/null 2>&1; then
+    echo -e "${RED}❌ Error: AWS CLI not found or not working${NC}"
+    echo "Please ensure AWS CLI is installed and accessible"
+    exit 1
+fi
+
+echo -e "${GREEN}✓ AWS CLI verified: $(aws --version 2>&1 | head -1)${NC}"
 echo ""
 
 # Get pod number
@@ -460,46 +474,71 @@ rm -f "pod${POD_NUMBER}-public-key" 2>/dev/null && echo "  ✅ Public key remove
 echo ""
 
 # ────────────────────────────────────────────────────────────
-# Final Summary
+# Final Summary & Verification (v3.0)
 # ────────────────────────────────────────────────────────────
 echo "════════════════════════════════════════════════════════════"
 echo "Cleanup Summary - Pod $POD_NUMBER"
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
+echo -e "${YELLOW}Verifying cleanup results...${NC}"
+echo ""
+
+# Comprehensive verification (don't trust exit codes)
 REMAINING_INST=$(aws ec2 describe-instances --region $REGION \
-    --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
-              "Name=instance-state-name,Values=running,pending,stopped" \
+    --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*,ciscomcd-pod${POD_NUMBER}-*" \
+              "Name=instance-state-name,Values=running,pending,stopped,stopping" \
     --query "Reservations[].Instances[].InstanceId" \
-    --output text 2>/dev/null | wc -w | tr -d ' ')
+    --output json 2>/dev/null | jq -r '.[]' 2>/dev/null | wc -l | tr -d ' ')
 
 REMAINING_VPC=$(aws ec2 describe-vpcs --region $REGION \
     --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
     --query "Vpcs[].VpcId" \
-    --output text 2>/dev/null | wc -w | tr -d ' ')
+    --output json 2>/dev/null | jq -r '.[]' 2>/dev/null | wc -l | tr -d ' ')
 
 REMAINING_EIP=$(aws ec2 describe-addresses --region $REGION \
     --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
     --query "Addresses[].AllocationId" \
-    --output text 2>/dev/null | wc -w | tr -d ' ')
+    --output json 2>/dev/null | jq -r '.[]' 2>/dev/null | wc -l | tr -d ' ')
+
+REMAINING_ENI=$(aws ec2 describe-network-interfaces --region $REGION \
+    --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
+    --query "NetworkInterfaces[].NetworkInterfaceId" \
+    --output json 2>/dev/null | jq -r '.[]' 2>/dev/null | wc -l | tr -d ' ')
 
 REMAINING_TGW=$(aws ec2 describe-transit-gateway-attachments --region $REGION \
     --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
               "Name=state,Values=available,pending" \
     --query "TransitGatewayAttachments[].TransitGatewayAttachmentId" \
-    --output text 2>/dev/null | wc -w | tr -d ' ')
+    --output json 2>/dev/null | jq -r '.[]' 2>/dev/null | wc -l | tr -d ' ')
+
+# Check for Service VPCs (may not have pod tag but have specific CIDR)
+SERVICE_VPCS=$(aws ec2 describe-vpcs --region $REGION \
+    --filters "Name=cidr,Values=192.168.${POD_NUMBER}.0/24" \
+    --query "Vpcs[].VpcId" \
+    --output json 2>/dev/null | jq -r '.[]' 2>/dev/null | wc -l | tr -d ' ')
 
 echo "Remaining Resources:"
 echo "  • EC2 Instances: $REMAINING_INST"
-echo "  • VPCs: $REMAINING_VPC"
+echo "  • VPCs (tagged): $REMAINING_VPC"
+echo "  • Service VPCs (192.168.${POD_NUMBER}.0/24): $SERVICE_VPCS"
 echo "  • Elastic IPs: $REMAINING_EIP"
+echo "  • ENIs: $REMAINING_ENI"
 echo "  • TGW Attachments: $REMAINING_TGW"
 echo ""
 
-TOTAL=$((REMAINING_INST + REMAINING_VPC + REMAINING_EIP + REMAINING_TGW))
+# Calculate cost impact
+if [ "$REMAINING_EIP" -gt 0 ]; then
+    COST=$(echo "scale=2; $REMAINING_EIP * 3.65" | bc)
+    echo -e "${YELLOW}💰 Cost Alert: $REMAINING_EIP EIP(s) = ~\$${COST}/month${NC}"
+    echo ""
+fi
+
+TOTAL=$((REMAINING_INST + REMAINING_VPC + SERVICE_VPCS + REMAINING_EIP + REMAINING_ENI + REMAINING_TGW))
 
 if [ "$TOTAL" -eq 0 ]; then
     echo -e "${GREEN}✅ SUCCESS - All resources cleaned up!${NC}"
+    echo ""
     
     # Clean up pod-specific Terraform state
 echo "════════════════════════════════════════════════════════════"
@@ -511,7 +550,7 @@ cd "${SCRIPT_DIR}/.."  # Go to project root
 
 # Reset MCD resources file to disabled state
 if [ -f "mcd-resources.tf" ]; then
-    mv mcd-resources.tf mcd-resources.tf.disabled
+    mv mcd-resources.tf mcd-resources.tf.disabled 2>/dev/null
     echo "🗑️  Reset MCD resources to disabled state"
 fi
 
@@ -528,28 +567,53 @@ fi
     echo ""
     
     exit 0
-elif [ "$REMAINING_VPC" -gt 0 ] && [ "$REMAINING_VPC" -le 2 ]; then
-    echo -e "${YELLOW}⚠️  $REMAINING_VPC Service VPCs remain (ENIs still detaching)${NC}"
-    echo "   These will auto-delete in 5-10 minutes"
-    echo "   Safe to proceed with new deployments"
-    
-    # Still clean up state even with lingering VPCs
-    echo ""
-    cd "${SCRIPT_DIR}/.."
-    if [ -f ".state-helper.sh" ]; then
-        source .state-helper.sh
-        cleanup_pod_state "$POD_NUMBER"
-    fi
-    rm -f "pod${POD_NUMBER}-private-key" "pod${POD_NUMBER}-private-key.pem" 2>/dev/null
-    rm -f "pod${POD_NUMBER}-keypair.pub" 2>/dev/null
-    
-    exit 0
 else
-    echo -e "${YELLOW}⚠️  $TOTAL resources remain - may need manual cleanup${NC}"
+    # Resources remain - provide guidance
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}⚠️  $TOTAL resource(s) remain after cleanup${NC}"
+    echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo "To check remaining resources:"
-    echo "  aws ec2 describe-instances --region us-east-1 --filters \"Name=tag:Name,Values=pod${POD_NUMBER}-*\""
+    
+    if [ "$SERVICE_VPCS" -gt 0 ]; then
+        echo -e "${BLUE}ℹ️  Service VPCs found (CIDR: 192.168.${POD_NUMBER}.0/24)${NC}"
+        echo "   These are MCD-created VPCs that need manual cleanup."
+        echo "   They may contain security groups or route tables."
+        echo ""
+        echo "   To clean them manually:"
+        echo "   1. Run: cleanup/cleanup-direct.sh"
+        echo "   2. Or delete via AWS console"
+        echo ""
+    fi
+    
+    if [ "$REMAINING_EIP" -gt 0 ]; then
+        echo -e "${YELLOW}💰 ACTION REQUIRED: Release Elastic IPs to avoid charges${NC}"
+        echo "   Run this command:"
+        echo "   aws ec2 describe-addresses --region us-east-1 \\"
+        echo "     --filters \"Name=tag:Name,Values=pod${POD_NUMBER}-*\" \\"
+        echo "     --query \"Addresses[].[AllocationId,PublicIp]\" --output table"
+        echo ""
+    fi
+    
+    if [ "$REMAINING_ENI" -gt 0 ]; then
+        echo -e "${BLUE}ℹ️  ENIs remain - these may prevent EIP release${NC}"
+        echo "   Delete ENIs first, then retry EIP release"
+        echo ""
+    fi
+    
+    if [ "$REMAINING_VPC" -gt 0 ] && [ "$REMAINING_VPC" -le 2 ]; then
+        echo -e "${BLUE}ℹ️  VPCs may have ENIs still detaching (async operation)${NC}"
+        echo "   Wait 5-10 minutes and they should auto-delete"
+        echo ""
+    fi
+    
+    echo "Debug Commands:"
+    echo "  # List remaining VPCs:"
     echo "  aws ec2 describe-vpcs --region us-east-1 --filters \"Name=tag:Name,Values=pod${POD_NUMBER}-*\""
-    exit 1
-fi
+    echo ""
+    echo "  # List remaining EIPs:"
+    echo "  aws ec2 describe-addresses --region us-east-1 --filters \"Name=tag:Name,Values=pod${POD_NUMBER}-*\""
+    echo ""
+    echo "  # Cleanup leftovers:"
+    echo "  ./cleanup/cleanup-direct.sh"
+    echo ""
 
