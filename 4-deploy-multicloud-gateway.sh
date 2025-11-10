@@ -376,3 +376,80 @@ else
     exit 1
 fi
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# CRITICAL FIX: Disable Source/Dest Check on Gateway Instances
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# AWS EC2 instances have source/dest check enabled by default, which prevents them from 
+# routing/NAT'ing traffic. MCD gateways MUST have this disabled to function properly.
+# This is a known issue - the ciscomcd Terraform provider doesn't disable it automatically.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+if [ $APPLY_STATUS -eq 0 ]; then
+    echo ""
+    echo -e "${BLUE}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}Critical Fix: Disabling Source/Dest Check${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${YELLOW}Waiting for gateway instances to be fully ready...${NC}"
+    sleep 15  # Give instances time to fully initialize
+    
+    # Get all gateway instances for this pod
+    GATEWAY_INSTANCES=$(aws ec2 describe-instances --region us-east-1 \
+        --filters "Name=tag:Name,Values=ciscomcd-pod${POD_NUMBER}*gw*" "Name=instance-state-name,Values=running" \
+        --query "Reservations[].Instances[].InstanceId" --output text 2>/dev/null)
+    
+    if [ -n "$GATEWAY_INSTANCES" ]; then
+        echo -e "${CYAN}Found gateway instances:${NC}"
+        for INSTANCE_ID in $GATEWAY_INSTANCES; do
+            INSTANCE_NAME=$(aws ec2 describe-instances --region us-east-1 \
+                --instance-ids $INSTANCE_ID \
+                --query "Reservations[0].Instances[0].Tags[?Key=='Name'].Value | [0]" --output text)
+            echo "  • $INSTANCE_NAME ($INSTANCE_ID)"
+        done
+        echo ""
+        
+        echo -e "${YELLOW}Disabling source/dest check on all network interfaces...${NC}"
+        
+        FIXED_COUNT=0
+        for INSTANCE_ID in $GATEWAY_INSTANCES; do
+            # Get all network interfaces for this instance
+            ENIS=$(aws ec2 describe-network-interfaces --region us-east-1 \
+                --filters "Name=attachment.instance-id,Values=$INSTANCE_ID" \
+                --query "NetworkInterfaces[].NetworkInterfaceId" --output text 2>/dev/null)
+            
+            if [ -n "$ENIS" ]; then
+                for ENI in $ENIS; do
+                    # Disable source/dest check
+                    aws ec2 modify-network-interface-attribute --region us-east-1 \
+                        --network-interface-id $ENI --no-source-dest-check 2>/dev/null
+                    
+                    if [ $? -eq 0 ]; then
+                        echo "  ✓ $ENI - source/dest check disabled"
+                        ((FIXED_COUNT++))
+                    else
+                        echo "  ⚠️  $ENI - failed to disable (may already be disabled)"
+                    fi
+                done
+            fi
+        done
+        
+        echo ""
+        if [ $FIXED_COUNT -gt 0 ]; then
+            echo -e "${GREEN}✅ Successfully disabled source/dest check on $FIXED_COUNT network interface(s)${NC}"
+        else
+            echo -e "${YELLOW}⚠️  No changes made (interfaces may already be configured)${NC}"
+        fi
+        echo ""
+        echo -e "${CYAN}Why is this needed?${NC}"
+        echo "  MCD gateways act as routers/NAT devices and must forward packets"
+        echo "  that are not addressed to them. AWS blocks this by default for security."
+        echo "  Disabling source/dest check allows the gateways to route traffic properly."
+        echo ""
+    else
+        echo -e "${YELLOW}⚠️  No gateway instances found yet${NC}"
+        echo "  Instances may still be launching. You can manually disable source/dest check later:"
+        echo "  aws ec2 modify-network-interface-attribute --network-interface-id <ENI> --no-source-dest-check"
+        echo ""
+    fi
+fi
+

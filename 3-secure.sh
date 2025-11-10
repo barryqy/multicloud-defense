@@ -365,7 +365,9 @@ echo ""
 # Apply the plan with real-time output
 # NOTE: -parallelism=1 prevents MCD provider race conditions (Nov 10, 2025)
 # To revert: remove -parallelism=1 flag if it causes issues
-terraform apply -parallelism=1 -auto-approve security-tfplan 2>&1 | tee /tmp/mcd-secure-apply.log | while IFS= read -r line; do
+# terraform apply -parallelism=1 -auto-approve security-tfplan 2>&1 | tee /tmp/mcd-secure-apply.log | while IFS= read -r line; do
+
+terraform apply -auto-approve security-tfplan 2>&1 | tee /tmp/mcd-secure-apply.log | while IFS= read -r line; do
     # Show creation/modification lines, hide sensitive info
     if echo "$line" | grep -qE "(Creating|Modifying|Creation complete|Still creating)"; then
         echo "$line"
