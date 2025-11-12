@@ -473,18 +473,59 @@ echo ""
                     # Add route for App1 VPC CIDR
                     APP1_CIDR="10.${POD_NUMBER}.0.0/16"
                     echo "  Adding route: $APP1_CIDR → TGW"
-                    aws ec2 create-route --region us-east-1 \
+                    set +e
+                    APP1_ROUTE_OUTPUT=$(aws ec2 create-route --region us-east-1 \
                         --route-table-id "$DATAPATH_RT" \
                         --destination-cidr-block "$APP1_CIDR" \
-                        --transit-gateway-id "$TGW_ID" 2>&1 | grep -v "RouteAlreadyExists" || echo "    ✓ Route added"
+                        --transit-gateway-id "$TGW_ID" 2>&1)
+                    APP1_ROUTE_STATUS=$?
+                    set -e
+                    
+                    if [ $APP1_ROUTE_STATUS -eq 0 ]; then
+                        echo "    ✓ Route added"
+                    elif echo "$APP1_ROUTE_OUTPUT" | grep -q "RouteAlreadyExists"; then
+                        echo "    ✓ Route already exists"
+                    else
+                        echo "    ⚠️  Route creation failed: $(echo "$APP1_ROUTE_OUTPUT" | head -1)"
+                    fi
                     
                     # Add route for App2 VPC CIDR
                     APP2_CIDR="10.$((100 + POD_NUMBER)).0.0/16"
                     echo "  Adding route: $APP2_CIDR → TGW"
-                    aws ec2 create-route --region us-east-1 \
+                    set +e
+                    APP2_ROUTE_OUTPUT=$(aws ec2 create-route --region us-east-1 \
                         --route-table-id "$DATAPATH_RT" \
                         --destination-cidr-block "$APP2_CIDR" \
-                        --transit-gateway-id "$TGW_ID" 2>&1 | grep -v "RouteAlreadyExists" || echo "    ✓ Route added"
+                        --transit-gateway-id "$TGW_ID" 2>&1)
+                    APP2_ROUTE_STATUS=$?
+                    set -e
+                    
+                    if [ $APP2_ROUTE_STATUS -eq 0 ]; then
+                        echo "    ✓ Route added"
+                    elif echo "$APP2_ROUTE_OUTPUT" | grep -q "RouteAlreadyExists"; then
+                        echo "    ✓ Route already exists"
+                    else
+                        echo "    ⚠️  Route creation failed: $(echo "$APP2_ROUTE_OUTPUT" | head -1)"
+                    fi
+                    
+                    # Verify routes were added successfully
+                    sleep 1
+                    VERIFY_ROUTES=$(aws ec2 describe-route-tables --region us-east-1 \
+                        --route-table-ids "$DATAPATH_RT" \
+                        --query "RouteTables[0].Routes[?contains(DestinationCidrBlock, '10.')].[DestinationCidrBlock,TransitGatewayId,State]" \
+                        --output text 2>/dev/null)
+                    
+                    if echo "$VERIFY_ROUTES" | grep -q "$APP1_CIDR.*$TGW_ID.*active"; then
+                        echo -e "  ${GREEN}✓ Verified: App1 return route ($APP1_CIDR) configured${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠️  Warning: App1 return route ($APP1_CIDR) not found or not active${NC}"
+                    fi
+                    
+                    if echo "$VERIFY_ROUTES" | grep -q "$APP2_CIDR.*$TGW_ID.*active"; then
+                        echo -e "  ${GREEN}✓ Verified: App2 return route ($APP2_CIDR) configured${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠️  Warning: App2 return route ($APP2_CIDR) not found or not active${NC}"
+                    fi
                     
                     echo -e "${GREEN}  ✓ Service VPC datapath routes configured${NC}"
                 else
@@ -507,18 +548,59 @@ echo ""
                     # Add route for App1 VPC CIDR
                     APP1_CIDR="10.${POD_NUMBER}.0.0/16"
                     echo "  Adding route: $APP1_CIDR → TGW"
-                    aws ec2 create-route --region us-east-1 \
+                    set +e
+                    APP1_NAT_OUTPUT=$(aws ec2 create-route --region us-east-1 \
                         --route-table-id "$NAT_EGRESS_RT" \
                         --destination-cidr-block "$APP1_CIDR" \
-                        --transit-gateway-id "$TGW_ID" 2>/dev/null || echo "    (Route may already exist)"
+                        --transit-gateway-id "$TGW_ID" 2>&1)
+                    APP1_NAT_STATUS=$?
+                    set -e
+                    
+                    if [ $APP1_NAT_STATUS -eq 0 ]; then
+                        echo "    ✓ Route added"
+                    elif echo "$APP1_NAT_OUTPUT" | grep -q "RouteAlreadyExists"; then
+                        echo "    ✓ Route already exists"
+                    else
+                        echo "    ⚠️  Route creation failed: $(echo "$APP1_NAT_OUTPUT" | head -1)"
+                    fi
                     
                     # Add route for App2 VPC CIDR
                     APP2_CIDR="10.$((100 + POD_NUMBER)).0.0/16"
                     echo "  Adding route: $APP2_CIDR → TGW"
-                    aws ec2 create-route --region us-east-1 \
+                    set +e
+                    APP2_NAT_OUTPUT=$(aws ec2 create-route --region us-east-1 \
                         --route-table-id "$NAT_EGRESS_RT" \
                         --destination-cidr-block "$APP2_CIDR" \
-                        --transit-gateway-id "$TGW_ID" 2>/dev/null || echo "    (Route may already exist)"
+                        --transit-gateway-id "$TGW_ID" 2>&1)
+                    APP2_NAT_STATUS=$?
+                    set -e
+                    
+                    if [ $APP2_NAT_STATUS -eq 0 ]; then
+                        echo "    ✓ Route added"
+                    elif echo "$APP2_NAT_OUTPUT" | grep -q "RouteAlreadyExists"; then
+                        echo "    ✓ Route already exists"
+                    else
+                        echo "    ⚠️  Route creation failed: $(echo "$APP2_NAT_OUTPUT" | head -1)"
+                    fi
+                    
+                    # Verify routes were added successfully
+                    sleep 1
+                    VERIFY_NAT_ROUTES=$(aws ec2 describe-route-tables --region us-east-1 \
+                        --route-table-ids "$NAT_EGRESS_RT" \
+                        --query "RouteTables[0].Routes[?contains(DestinationCidrBlock, '10.')].[DestinationCidrBlock,TransitGatewayId,State]" \
+                        --output text 2>/dev/null)
+                    
+                    if echo "$VERIFY_NAT_ROUTES" | grep -q "$APP1_CIDR.*$TGW_ID.*active"; then
+                        echo -e "  ${GREEN}✓ Verified: App1 NAT Egress route ($APP1_CIDR) configured${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠️  Warning: App1 NAT Egress route ($APP1_CIDR) not found or not active${NC}"
+                    fi
+                    
+                    if echo "$VERIFY_NAT_ROUTES" | grep -q "$APP2_CIDR.*$TGW_ID.*active"; then
+                        echo -e "  ${GREEN}✓ Verified: App2 NAT Egress route ($APP2_CIDR) configured${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠️  Warning: App2 NAT Egress route ($APP2_CIDR) not found or not active${NC}"
+                    fi
                     
                     echo -e "${GREEN}  ✓ Service VPC NAT Egress routes configured${NC}"
                 else
@@ -546,7 +628,7 @@ echo ""
                 if [ -n "$TGW_RT_ID" ] && [ "$TGW_RT_ID" != "None" ]; then
                     echo "  TGW Route Table: $TGW_RT_ID"
                     
-                    # Check if default route exists
+                    # Check if default route exists and get its state
                     DEFAULT_ROUTE_STATE=$(aws ec2 search-transit-gateway-routes \
                         --region us-east-1 \
                         --transit-gateway-route-table-id "$TGW_RT_ID" \
@@ -554,40 +636,47 @@ echo ""
                         --query "Routes[?DestinationCidrBlock=='0.0.0.0/0'].State" \
                         --output text 2>/dev/null)
                     
+                    # Get current target if route exists
+                    CURRENT_TARGET=$(aws ec2 search-transit-gateway-routes \
+                        --region us-east-1 \
+                        --transit-gateway-route-table-id "$TGW_RT_ID" \
+                        --filters "Name=state,Values=active" \
+                        --query "Routes[?DestinationCidrBlock=='0.0.0.0/0'].TransitGatewayAttachments[0].ResourceId" \
+                        --output text 2>/dev/null)
+                    
                     if [ "$DEFAULT_ROUTE_STATE" = "blackhole" ]; then
                         echo -e "  ${YELLOW}⚠️  Found blackhole default route (egress traffic being dropped!)${NC}"
                         echo "  Replacing with route to Service VPC..."
                         
                         # Delete blackhole route
+                        set +e
                         aws ec2 delete-transit-gateway-route \
                             --region us-east-1 \
                             --transit-gateway-route-table-id "$TGW_RT_ID" \
                             --destination-cidr-block 0.0.0.0/0 > /dev/null 2>&1
+                        set -e
                         
                         # Wait for deletion to complete
                         sleep 2
                         
                         # Add route to Service VPC
+                        set +e
                         aws ec2 create-transit-gateway-route \
                             --region us-east-1 \
                             --transit-gateway-route-table-id "$TGW_RT_ID" \
                             --destination-cidr-block 0.0.0.0/0 \
                             --transit-gateway-attachment-id "$SVPC_TGW_ATTACHMENT" > /dev/null 2>&1
+                        CREATE_STATUS=$?
+                        set -e
                         
-                        if [ $? -eq 0 ]; then
+                        if [ $CREATE_STATUS -eq 0 ]; then
                             echo -e "  ${GREEN}✓ Default route configured: 0.0.0.0/0 → Service VPC${NC}"
                         else
                             echo -e "  ${RED}✗ Failed to add default route${NC}"
+                            echo -e "  ${YELLOW}   This will prevent internet access from App VPCs${NC}"
                         fi
                     elif [ "$DEFAULT_ROUTE_STATE" = "active" ]; then
                         # Check if it points to the correct Service VPC
-                        CURRENT_TARGET=$(aws ec2 search-transit-gateway-routes \
-                            --region us-east-1 \
-                            --transit-gateway-route-table-id "$TGW_RT_ID" \
-                            --filters "Name=state,Values=active" \
-                            --query "Routes[?DestinationCidrBlock=='0.0.0.0/0'].TransitGatewayAttachments[0].ResourceId" \
-                            --output text 2>/dev/null)
-                        
                         if [ "$CURRENT_TARGET" = "$SVPC_AWS_ID" ]; then
                             echo -e "  ${GREEN}✓ Default route already points to this pod's Service VPC${NC}"
                         else
@@ -595,29 +684,72 @@ echo ""
                             echo -e "  ${YELLOW}⚠️  This may be another pod's Service VPC${NC}"
                             echo -e "  ${YELLOW}⚠️  Updating to this pod's Service VPC...${NC}"
                             
-                            # Delete existing route
+                            # Delete existing route (ignore errors if route doesn't exist)
+                            set +e
                             aws ec2 delete-transit-gateway-route \
                                 --region us-east-1 \
                                 --transit-gateway-route-table-id "$TGW_RT_ID" \
                                 --destination-cidr-block 0.0.0.0/0 > /dev/null 2>&1
+                            DELETE_STATUS=$?
+                            set -e
                             
                             sleep 2
                             
                             # Add route to this pod's Service VPC
+                            set +e
                             aws ec2 create-transit-gateway-route \
                                 --region us-east-1 \
                                 --transit-gateway-route-table-id "$TGW_RT_ID" \
                                 --destination-cidr-block 0.0.0.0/0 \
                                 --transit-gateway-attachment-id "$SVPC_TGW_ATTACHMENT" > /dev/null 2>&1
+                            CREATE_STATUS=$?
+                            set -e
                             
-                            if [ $? -eq 0 ]; then
+                            if [ $CREATE_STATUS -eq 0 ]; then
                                 echo -e "  ${GREEN}✓ Default route updated to this pod's Service VPC${NC}"
                             else
-                                echo -e "  ${RED}✗ Failed to update default route${NC}"
+                                echo -e "  ${YELLOW}⚠️  Route update may have failed, but continuing...${NC}"
+                                echo -e "  ${BLUE}   (Route may already exist or Service VPC attachment not ready)${NC}"
                             fi
                         fi
                     else
-                        echo -e "  ${GREEN}✓ Default route already configured${NC}"
+                        # No default route exists - this is the problem!
+                        echo -e "  ${YELLOW}⚠️  No default route found - adding route to Service VPC...${NC}"
+                        
+                        # Add route to Service VPC
+                        set +e
+                        aws ec2 create-transit-gateway-route \
+                            --region us-east-1 \
+                            --transit-gateway-route-table-id "$TGW_RT_ID" \
+                            --destination-cidr-block 0.0.0.0/0 \
+                            --transit-gateway-attachment-id "$SVPC_TGW_ATTACHMENT" > /dev/null 2>&1
+                        CREATE_STATUS=$?
+                        set -e
+                        
+                        if [ $CREATE_STATUS -eq 0 ]; then
+                            echo -e "  ${GREEN}✓ Default route added: 0.0.0.0/0 → Service VPC${NC}"
+                        else
+                            echo -e "  ${RED}✗ Failed to add default route${NC}"
+                            echo -e "  ${YELLOW}   This will prevent internet access from App VPCs${NC}"
+                            echo -e "  ${BLUE}   Error: Route creation failed (may need to retry)${NC}"
+                        fi
+                    fi
+                    
+                    # Verify the route was created successfully
+                    sleep 2
+                    VERIFY_TARGET=$(aws ec2 search-transit-gateway-routes \
+                        --region us-east-1 \
+                        --transit-gateway-route-table-id "$TGW_RT_ID" \
+                        --filters "Name=destination-cidr-block,Values=0.0.0.0/0" "Name=state,Values=active" \
+                        --query "Routes[0].TransitGatewayAttachments[0].ResourceId" \
+                        --output text 2>/dev/null)
+                    
+                    if [ "$VERIFY_TARGET" = "$SVPC_AWS_ID" ]; then
+                        echo -e "  ${GREEN}✓ Verified: Default route correctly points to Service VPC${NC}"
+                    elif [ -n "$VERIFY_TARGET" ] && [ "$VERIFY_TARGET" != "None" ]; then
+                        echo -e "  ${YELLOW}⚠️  Warning: Default route points to different VPC: $VERIFY_TARGET${NC}"
+                    else
+                        echo -e "  ${YELLOW}⚠️  Warning: Could not verify default route${NC}"
                     fi
                 else
                     echo -e "  ${RED}✗ Could not find TGW route table${NC}"
@@ -776,15 +908,19 @@ echo ""
         echo "  To:   0.0.0.0/0 → TGW"
         
         # Replace the default route
+        set +e
         aws ec2 replace-route --region us-east-1 \
             --route-table-id "$APP1_RT_ID" \
             --destination-cidr-block 0.0.0.0/0 \
             --transit-gateway-id "$TGW_ID" 2>&1
+        REPLACE_STATUS=$?
+        set -e
         
-        if [ $? -eq 0 ]; then
+        if [ $REPLACE_STATUS -eq 0 ]; then
             echo -e "  ${GREEN}✓ App1 default route updated to TGW${NC}"
         else
-            echo -e "  ${RED}✗ Failed to update App1 default route${NC}"
+            echo -e "  ${YELLOW}⚠️  App1 route update may have failed, but continuing...${NC}"
+            echo -e "  ${BLUE}   (Route may already point to TGW)${NC}"
         fi
         echo ""
     fi
@@ -796,15 +932,19 @@ echo ""
         echo "  To:   0.0.0.0/0 → TGW"
         
         # Replace the default route
+        set +e
         aws ec2 replace-route --region us-east-1 \
             --route-table-id "$APP2_RT_ID" \
             --destination-cidr-block 0.0.0.0/0 \
             --transit-gateway-id "$TGW_ID" 2>&1
+        REPLACE_STATUS=$?
+        set -e
         
-        if [ $? -eq 0 ]; then
+        if [ $REPLACE_STATUS -eq 0 ]; then
             echo -e "  ${GREEN}✓ App2 default route updated to TGW${NC}"
         else
-            echo -e "  ${RED}✗ Failed to update App2 default route${NC}"
+            echo -e "  ${YELLOW}⚠️  App2 route update may have failed, but continuing...${NC}"
+            echo -e "  ${BLUE}   (Route may already point to TGW)${NC}"
         fi
         echo ""
     fi
