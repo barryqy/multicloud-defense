@@ -6,7 +6,6 @@
 # - East-West Security: Allow pod app1 to app2 communication
 # - Ingress Protection: IPS/WAF for web server protection
 
-set -e
 
 # Colors for output
 RED='\033[0;31m'

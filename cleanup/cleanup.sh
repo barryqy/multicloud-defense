@@ -27,6 +27,9 @@ set -e
 # CRITICAL: Use system AWS CLI (not broken binaries)
 export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
+# CRITICAL: Disable AWS CLI pager to prevent script from hanging
+export AWS_PAGER=""
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,10 +52,25 @@ fi
 echo -e "${GREEN}✓ AWS CLI verified: $(aws --version 2>&1 | head -1)${NC}"
 echo ""
 
-# Get pod number
+# Get pod number - prioritize auto-detection from terraform.tfvars
 if [ -n "$1" ]; then
+    # Pod number provided as argument (for automation)
     POD_NUMBER="$1"
+    echo -e "${BLUE}Pod Number (from argument): ${POD_NUMBER}${NC}"
+elif [ -f "terraform.tfvars" ]; then
+    # Auto-detect from terraform.tfvars (safest - prevents accidental cleanup)
+    POD_NUMBER=$(grep -E '^pod_number' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
+    if [ -n "$POD_NUMBER" ]; then
+        echo -e "${GREEN}✓ Auto-detected Pod Number from terraform.tfvars: ${POD_NUMBER}${NC}"
+        echo -e "${BLUE}   This prevents accidental cleanup of another pod's resources${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Pod number not found in terraform.tfvars${NC}"
+        read -p "Enter your pod number (1-50): " POD_NUMBER
+    fi
 else
+    # No terraform.tfvars - prompt user (but warn them)
+    echo -e "${YELLOW}⚠️  terraform.tfvars not found - cannot auto-detect pod number${NC}"
+    echo -e "${YELLOW}   Please double-check you're cleaning up the correct pod!${NC}"
     read -p "Enter your pod number (1-50): " POD_NUMBER
 fi
 
@@ -87,12 +105,19 @@ echo ""
 if [ -f "${SCRIPT_DIR}/cleanup-mcd-resources.sh" ]; then
     echo -e "${YELLOW}🔧 Cleaning up MCD resources...${NC}"
     bash "${SCRIPT_DIR}/cleanup-mcd-resources.sh" "$POD_NUMBER" || {
-        echo -e "${YELLOW}⚠️  MCD cleanup had issues, continuing with AWS cleanup...${NC}"
+        echo -e "${YELLOW}⚠️  MCD cleanup had issues${NC}"
+        echo "   If Service VPC deletion fails later, you may need to:"
+        echo "   1. Delete Service VPC manually in MCD dashboard, OR"
+        echo "   2. Re-run: ${SCRIPT_DIR}/cleanup-mcd-resources.sh $POD_NUMBER"
+        echo "   Continuing with AWS cleanup..."
     }
 else
     echo -e "${YELLOW}⚠️  MCD cleanup script not found${NC}"
     echo "   Expected location: ${SCRIPT_DIR}/cleanup-mcd-resources.sh"
-    echo "   You may need to manually delete MCD resources from the console"
+    echo ""
+    echo "   ⚠️  WARNING: Service VPCs cannot be deleted via AWS API"
+    echo "   They must be deleted via MCD API first."
+    echo "   If Service VPC deletion fails, delete it manually in the MCD dashboard"
 fi
 echo ""
 
@@ -131,8 +156,12 @@ if [ -n "$INSTANCE_IDS" ]; then
     INST_COUNT=$(echo "$INSTANCE_IDS" | wc -l | tr -d ' ')
     echo "  Found $INST_COUNT instance(s) - forcing termination"
     
+    # Disable pager to prevent script from hanging
+    export AWS_PAGER=""
+    
     # Force terminate ALL instances at once for speed
-    echo "$INSTANCE_IDS" | xargs -n 20 aws ec2 terminate-instances --region $REGION --instance-ids 2>/dev/null || true
+    # Suppress JSON output to prevent pager issues
+    echo "$INSTANCE_IDS" | xargs -n 20 aws ec2 terminate-instances --region $REGION --instance-ids > /dev/null 2>&1 || true
     
     # Also terminate them one by one as backup (in case batch fails)
     for INSTANCE_ID in $INSTANCE_IDS; do
@@ -228,6 +257,7 @@ EIP_PID=$!
         --query 'Vpcs[].VpcId' \
         --output text 2>/dev/null || echo "")
     
+    # Find all load balancers by VPC ID (catches MCD GWLBs with generated names)
     LBS_FOUND=""
     for VPC in $VPCS; do
         VPC_LBS=$(aws elbv2 describe-load-balancers --region $REGION \
@@ -236,15 +266,72 @@ EIP_PID=$!
         LBS_FOUND="$LBS_FOUND $VPC_LBS"
     done
     
+    # Also check by name pattern as fallback (for LBs not in pod VPCs or edge cases)
+    NAME_PATTERN_LBS=$(aws elbv2 describe-load-balancers --region $REGION \
+        --query "LoadBalancers[?(contains(LoadBalancerName, 'pod${POD_NUMBER}') || contains(LoadBalancerName, 'ciscomcd'))].LoadBalancerArn" \
+        --output text 2>/dev/null || echo "")
+    
+    # Combine and deduplicate
+    LBS_FOUND=$(echo "$LBS_FOUND $NAME_PATTERN_LBS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    
     if [ -n "$LBS_FOUND" ]; then
         LB_COUNT=$(echo "$LBS_FOUND" | wc -w | tr -d ' ')
         echo "  [LB] Found $LB_COUNT load balancer(s)"
         
         for LB_ARN in $LBS_FOUND; do
-            aws elbv2 delete-load-balancer --region $REGION \
-                --load-balancer-arn $LB_ARN > /dev/null 2>&1 && \
-                echo "  [LB] ✅ LB deleted" || \
-                echo "  [LB] ❌ LB deletion failed"
+            if [ -z "$LB_ARN" ] || [ "$LB_ARN" = "None" ]; then
+                continue
+            fi
+            
+            echo "  [LB] Processing: $LB_ARN"
+            
+            # Delete listeners first (required before LB deletion)
+            LISTENER_ARNS=$(aws elbv2 describe-listeners --region $REGION \
+                --load-balancer-arn "$LB_ARN" \
+                --query "Listeners[].ListenerArn" \
+                --output text 2>/dev/null || echo "")
+            
+            if [ -n "$LISTENER_ARNS" ] && [ "$LISTENER_ARNS" != "None" ]; then
+                for LISTENER_ARN in $LISTENER_ARNS; do
+                    aws elbv2 delete-listener --region $REGION \
+                        --listener-arn "$LISTENER_ARN" > /dev/null 2>&1 && \
+                        echo "    ✅ Deleted listener: $LISTENER_ARN" || true
+                done
+                sleep 2
+            fi
+            
+            # Delete target groups (required before LB deletion)
+            TG_ARNS=$(aws elbv2 describe-target-groups --region $REGION \
+                --load-balancer-arn "$LB_ARN" \
+                --query "TargetGroups[].TargetGroupArn" \
+                --output text 2>/dev/null || echo "")
+            
+            if [ -n "$TG_ARNS" ] && [ "$TG_ARNS" != "None" ]; then
+                for TG_ARN in $TG_ARNS; do
+                    aws elbv2 delete-target-group --region $REGION \
+                        --target-group-arn "$TG_ARN" > /dev/null 2>&1 && \
+                        echo "    ✅ Deleted target group: $TG_ARN" || true
+                done
+                sleep 2
+            fi
+            
+            # Now try to delete the load balancer
+            set +e
+            LB_DELETE_OUTPUT=$(aws elbv2 delete-load-balancer --region $REGION \
+                --load-balancer-arn "$LB_ARN" 2>&1)
+            LB_DELETE_STATUS=$?
+            set -e
+            
+            if [ $LB_DELETE_STATUS -eq 0 ]; then
+                echo "  [LB] ✅ LB deleted: $LB_ARN"
+            else
+                # Show actual error for debugging
+                ERROR_MSG=$(echo "$LB_DELETE_OUTPUT" | grep -i "error\|failed\|denied" | head -1 || echo "Unknown error")
+                echo "  [LB] ⚠️  LB deletion failed: $ERROR_MSG"
+                echo "  [LB]    LB ARN: $LB_ARN"
+                echo "  [LB]    This may be a Gateway Load Balancer (GWLB) managed by MCD"
+                echo "  [LB]    It will be deleted when Service VPC is cleaned up"
+            fi
         done
         
         echo "  [LB] Waiting 30 seconds for load balancers to delete..."
@@ -294,10 +381,19 @@ echo ""
 echo -e "${YELLOW}Step 6: Deleting VPCs and Dependencies...${NC}"
 
 # Re-query VPCs for this step (can't use $VPCS from parallel subprocess)
-VPCS=$(aws ec2 describe-vpcs --region $REGION \
+# Check for VPCs by tag AND by Service VPC CIDR (Service VPCs may not have tags)
+VPCS_TAGGED=$(aws ec2 describe-vpcs --region $REGION \
     --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
     --query 'Vpcs[].VpcId' \
     --output text 2>/dev/null || echo "")
+
+VPCS_SERVICE=$(aws ec2 describe-vpcs --region $REGION \
+    --filters "Name=cidr-block,Values=192.168.${POD_NUMBER}.0/24" \
+    --query 'Vpcs[].VpcId' \
+    --output text 2>/dev/null || echo "")
+
+# Combine both lists and remove duplicates
+VPCS=$(echo -e "$VPCS_TAGGED\n$VPCS_SERVICE" | grep -v '^$' | sort -u | tr '\n' ' ' || echo "")
 
 if [ -n "$VPCS" ]; then
     VPC_COUNT=$(echo "$VPCS" | wc -w | tr -d ' ')
@@ -309,41 +405,61 @@ if [ -n "$VPCS" ]; then
         
         echo "  Processing: $VPC_NAME ($VPC_ID)"
         
-        # 6a. Delete VPC Endpoints
+        # 6a. Detach TGW attachments (CRITICAL - must be done before VPC deletion)
+        # Check for TGW attachments by VPC ID (Service VPCs may not have pod tags)
+        TGW_ATTACH_FOR_VPC=$(aws ec2 describe-transit-gateway-attachments --region $REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+                      "Name=state,Values=available,pending,pendingAcceptance,modifying" \
+            --query "TransitGatewayAttachments[].TransitGatewayAttachmentId" \
+            --output text 2>/dev/null || echo "")
+        
+        if [ -n "$TGW_ATTACH_FOR_VPC" ] && [ "$TGW_ATTACH_FOR_VPC" != "None" ]; then
+            echo "    Detaching TGW attachment(s) for this VPC..."
+            for TGW_ATTACH_ID in $TGW_ATTACH_FOR_VPC; do
+                aws ec2 delete-transit-gateway-vpc-attachment --region $REGION \
+                    --transit-gateway-attachment-id "$TGW_ATTACH_ID" > /dev/null 2>&1 && \
+                    echo "      ✅ TGW attachment $TGW_ATTACH_ID deleted" || \
+                    echo "      ⚠️  TGW attachment $TGW_ATTACH_ID deletion failed"
+            done
+            echo "    Waiting 10 seconds for TGW detachment to propagate..."
+            sleep 10
+        fi
+        
+        # 6b. Delete VPC Endpoints
         for ENDPOINT_ID in $(aws ec2 describe-vpc-endpoints --region $REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query "VpcEndpoints[].VpcEndpointId" --output text 2>/dev/null); do
             aws ec2 delete-vpc-endpoints --region $REGION \
-                --vpc-endpoint-ids $ENDPOINT_ID 2>/dev/null
+                --vpc-endpoint-ids $ENDPOINT_ID > /dev/null 2>&1
         done
         
-        # 6b. Delete Network Interfaces (critical for Service VPCs)
+        # 6c. Delete Network Interfaces (critical for Service VPCs)
         for ENI_ID in $(aws ec2 describe-network-interfaces --region $REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query "NetworkInterfaces[].NetworkInterfaceId" --output text 2>/dev/null); do
             aws ec2 delete-network-interface --region $REGION \
-                --network-interface-id $ENI_ID 2>/dev/null || true
+                --network-interface-id $ENI_ID > /dev/null 2>&1 || true
         done
         
-        # 6c. Detach and delete IGWs
+        # 6d. Detach and delete IGWs
         for IGW_ID in $(aws ec2 describe-internet-gateways --region $REGION \
             --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
             --query "InternetGateways[].InternetGatewayId" --output text 2>/dev/null); do
             aws ec2 detach-internet-gateway --region $REGION \
-                --internet-gateway-id $IGW_ID --vpc-id $VPC_ID 2>/dev/null
+                --internet-gateway-id $IGW_ID --vpc-id $VPC_ID > /dev/null 2>&1
             aws ec2 delete-internet-gateway --region $REGION \
-                --internet-gateway-id $IGW_ID 2>/dev/null
+                --internet-gateway-id $IGW_ID > /dev/null 2>&1
         done
         
-        # 6d. Delete subnets
+        # 6e. Delete subnets
         for SUBNET_ID in $(aws ec2 describe-subnets --region $REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query "Subnets[].SubnetId" --output text 2>/dev/null); do
             aws ec2 delete-subnet --region $REGION \
-                --subnet-id $SUBNET_ID 2>/dev/null
+                --subnet-id $SUBNET_ID > /dev/null 2>&1
         done
         
-        # 6e. Delete route tables (non-main) with disassociation
+        # 6f. Delete route tables (non-main) with disassociation
         for RT_ID in $(aws ec2 describe-route-tables --region $REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query "RouteTables[?Associations[0].Main!=\`true\`].RouteTableId" --output text 2>/dev/null); do
@@ -353,13 +469,13 @@ if [ -n "$VPCS" ]; then
                 --query "RouteTables[0].Associations[?!Main].RouteTableAssociationId" \
                 --output text 2>/dev/null); do
                 aws ec2 disassociate-route-table --region $REGION \
-                    --association-id $ASSOC_ID 2>/dev/null || true
+                    --association-id $ASSOC_ID > /dev/null 2>&1 || true
             done
             aws ec2 delete-route-table --region $REGION \
-                --route-table-id $RT_ID 2>/dev/null
+                --route-table-id $RT_ID > /dev/null 2>&1
         done
         
-        # 6f. Delete security groups (non-default) with rule cleanup
+        # 6g. Delete security groups (non-default) with rule cleanup
         # Retry up to 3 times to handle inter-group dependencies
         for ATTEMPT in 1 2 3; do
             SG_IDS=$(aws ec2 describe-security-groups --region $REGION \
@@ -373,25 +489,124 @@ if [ -n "$VPCS" ]; then
                 aws ec2 describe-security-groups --region $REGION --group-ids $SG_ID \
                     --query "SecurityGroups[0].IpPermissions" 2>/dev/null | \
                     aws ec2 revoke-security-group-ingress --region $REGION \
-                    --group-id $SG_ID --ip-permissions file:///dev/stdin 2>/dev/null || true
+                    --group-id $SG_ID --ip-permissions file:///dev/stdin > /dev/null 2>&1 || true
                 
                 aws ec2 describe-security-groups --region $REGION --group-ids $SG_ID \
                     --query "SecurityGroups[0].IpPermissionsEgress" 2>/dev/null | \
                     aws ec2 revoke-security-group-egress --region $REGION \
-                    --group-id $SG_ID --ip-permissions file:///dev/stdin 2>/dev/null || true
+                    --group-id $SG_ID --ip-permissions file:///dev/stdin > /dev/null 2>&1 || true
                 
                 aws ec2 delete-security-group --region $REGION \
-                    --group-id $SG_ID 2>/dev/null || true
+                    --group-id $SG_ID > /dev/null 2>&1 || true
             done
             
             [ $ATTEMPT -lt 3 ] && sleep 2
         done
         
-        # 6g. Delete VPC
+        # 6h. Check for remaining dependencies before deletion
+        echo "    Checking for remaining dependencies..."
+        
+        # Check for Gateway Load Balancers (common blocker for Service VPCs)
+        GWLB_ARNS=$(aws elbv2 describe-load-balancers --region $REGION \
+            --query "LoadBalancers[?VpcId=='$VPC_ID' && Type=='gateway'].LoadBalancerArn" \
+            --output text 2>/dev/null || echo "")
+        
+        if [ -n "$GWLB_ARNS" ] && [ "$GWLB_ARNS" != "None" ]; then
+            echo "    ⚠️  Found Gateway Load Balancer(s) - these are managed by MCD"
+            for GWLB_ARN in $GWLB_ARNS; do
+                echo "      GWLB: $GWLB_ARN"
+            done
+            echo "    ℹ️  Service VPC must be deleted via MCD API first"
+            echo "    ℹ️  Run: cleanup-mcd-resources.sh or delete Service VPC in MCD dashboard"
+            continue
+        fi
+        
+        # Check for remaining ENIs
+        REMAINING_ENIS=$(aws ec2 describe-network-interfaces --region $REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "NetworkInterfaces[].NetworkInterfaceId" \
+            --output text 2>/dev/null | wc -w | tr -d ' ')
+        
+        if [ "$REMAINING_ENIS" != "0" ] && [ -n "$REMAINING_ENIS" ]; then
+            echo "    ⚠️  Found $REMAINING_ENIS remaining ENI(s) - waiting 10 seconds..."
+            sleep 10
+            # Try to delete ENIs again
+            for ENI_ID in $(aws ec2 describe-network-interfaces --region $REGION \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query "NetworkInterfaces[].NetworkInterfaceId" --output text 2>/dev/null); do
+                aws ec2 delete-network-interface --region $REGION \
+                    --network-interface-id $ENI_ID > /dev/null 2>&1 || true
+            done
+            sleep 5
+        fi
+        
+        # 6i. Delete VPC
         sleep 2
-        aws ec2 delete-vpc --region $REGION --vpc-id $VPC_ID 2>/dev/null && \
-            echo "    ✅ Deleted" || \
-            echo "    ⚠️  Still has dependencies (will retry)"
+        set +e
+        VPC_DELETE_OUTPUT=$(aws ec2 delete-vpc --region $REGION --vpc-id $VPC_ID 2>&1)
+        VPC_DELETE_STATUS=$?
+        set -e
+        
+        if [ $VPC_DELETE_STATUS -eq 0 ]; then
+            echo "    ✅ VPC deleted successfully"
+        else
+            # Show actual error for debugging
+            ERROR_MSG=$(echo "$VPC_DELETE_OUTPUT" | grep -i "error\|failed\|denied\|dependencies" | head -1 || echo "Unknown error")
+            echo "    ❌ VPC deletion failed: $ERROR_MSG"
+            echo "    VPC ID: $VPC_ID"
+            
+            # Check if it's a Service VPC
+            if echo "$VPC_NAME" | grep -q "svpc"; then
+                echo "    ℹ️  This is a Service VPC"
+                
+                # Check if it exists in MCD API
+                if [ -f "${SCRIPT_DIR}/cleanup-mcd-resources.sh" ] && [ -f "${SCRIPT_DIR}/../reference/.creds/mcd-api.json" ]; then
+                    echo "    ℹ️  Checking if Service VPC exists in MCD..."
+                    # Quick check via MCD API
+                    MCD_JSON_FILE="${SCRIPT_DIR}/../reference/.creds/mcd-api.json"
+                    MCD_ACCT_NAME=$(jq -r '.acctName' "$MCD_JSON_FILE" 2>/dev/null || echo "")
+                    MCD_BASE_URL="https://$(jq -r '.restAPIServer' "$MCD_JSON_FILE" 2>/dev/null || echo "")"
+                    MCD_PUBLIC_KEY=$(jq -r '.apiKeyID' "$MCD_JSON_FILE" 2>/dev/null || echo "")
+                    MCD_PRIVATE_KEY=$(jq -r '.apiKeySecret' "$MCD_JSON_FILE" 2>/dev/null || echo "")
+                    
+                    if [ -n "$MCD_ACCT_NAME" ] && [ -n "$MCD_BASE_URL" ]; then
+                        ACCESS_TOKEN=$(curl -s -X POST "$MCD_BASE_URL/api/v1/user/gettoken" \
+                            -H "Content-Type: application/json" \
+                            -d "{\"common\":{\"acctName\":\"$MCD_ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"Valtix-2022\"},\"apiKeyID\":\"$MCD_PUBLIC_KEY\",\"apiKeySecret\":\"$MCD_PRIVATE_KEY\"}" \
+                            | jq -r '.accessToken' 2>/dev/null || echo "")
+                        
+                        if [ -n "$ACCESS_TOKEN" ] && [ "$ACCESS_TOKEN" != "null" ]; then
+                            CSP_LIST=$(curl -s -X POST "$MCD_BASE_URL/api/v1/cspaccount/list" \
+                                -H "Content-Type: application/json" \
+                                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                                -d "{\"common\":{\"acctName\":\"$MCD_ACCT_NAME\",\"source\":\"RESTAPI\",\"clientVersion\":\"Valtix-2022\"}}" \
+                                2>/dev/null)
+                            
+                            SVPC_EXISTS=$(echo "$CSP_LIST" | jq -r ".cspAccounts[]? | select(.name == \"$VPC_NAME\") | .name" 2>/dev/null || echo "")
+                            
+                            if [ -z "$SVPC_EXISTS" ] || [ "$SVPC_EXISTS" == "null" ]; then
+                                echo "    ⚠️  Service VPC is ORPHANED (exists in AWS but not in MCD)"
+                                echo "    ⚠️  Gateway Load Balancer is blocking deletion"
+                                echo "    ℹ️  Options:"
+                                echo "       1. Wait for AWS auto-cleanup (can take hours/days)"
+                                echo "       2. Contact MCD support to clean up orphaned GWLB"
+                                echo "       3. Try recreating Service VPC in MCD, then delete properly"
+                            else
+                                echo "    ℹ️  Service VPC exists in MCD - should have been deleted by cleanup-mcd-resources.sh"
+                                echo "    ℹ️  Re-run: ./cleanup-mcd-resources.sh $POD_NUMBER"
+                            fi
+                        fi
+                    fi
+                else
+                    echo "    ℹ️  Service VPC must be deleted via MCD API first"
+                    echo "    ℹ️  Run: ./cleanup-mcd-resources.sh $POD_NUMBER"
+                    echo "    ℹ️  Or delete it manually in the MCD dashboard"
+                fi
+            else
+                echo "    ℹ️  Common blockers: Gateway Load Balancers, remaining ENIs, or TGW attachments"
+                echo "    ℹ️  Will retry in Step 7 (Aggressive cleanup)"
+            fi
+        fi
     done
 else
     echo "  No VPCs found"
@@ -405,10 +620,19 @@ echo -e "${YELLOW}Step 7: Aggressive VPC cleanup...${NC}"
 echo "  Waiting 30 seconds for ENIs to fully detach..."
 sleep 30
 
-REMAINING_VPCS=$(aws ec2 describe-vpcs --region $REGION \
+# Check for VPCs by tag AND by Service VPC CIDR (Service VPCs may not have tags)
+REMAINING_VPCS_TAGGED=$(aws ec2 describe-vpcs --region $REGION \
     --filters "Name=tag:Name,Values=pod${POD_NUMBER}-*" \
     --query "Vpcs[].VpcId" \
     --output json 2>/dev/null | jq -r '.[]' || echo "")
+
+REMAINING_VPCS_SERVICE=$(aws ec2 describe-vpcs --region $REGION \
+    --filters "Name=cidr-block,Values=192.168.${POD_NUMBER}.0/24" \
+    --query "Vpcs[].VpcId" \
+    --output json 2>/dev/null | jq -r '.[]' || echo "")
+
+# Combine both lists and remove duplicates
+REMAINING_VPCS=$(echo -e "$REMAINING_VPCS_TAGGED\n$REMAINING_VPCS_SERVICE" | grep -v '^$' | sort -u || echo "")
 
 if [ -n "$REMAINING_VPCS" ]; then
     VPC_RETRY_COUNT=$(echo "$REMAINING_VPCS" | wc -l | tr -d ' ')
@@ -420,7 +644,36 @@ if [ -n "$REMAINING_VPCS" ]; then
         
         echo "  🔍 Processing: $VPC_NAME ($VPC_ID)"
         
-        # 7a. Force delete any remaining ENIs (retry)
+        # 7a. Detach TGW attachments FIRST (CRITICAL for Service VPCs)
+        TGW_ATTACH_FOR_VPC=$(aws ec2 describe-transit-gateway-attachments --region $REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+                      "Name=state,Values=available,pending,pendingAcceptance,modifying,deleting" \
+            --query "TransitGatewayAttachments[].TransitGatewayAttachmentId" \
+            --output text 2>/dev/null || echo "")
+        
+        if [ -n "$TGW_ATTACH_FOR_VPC" ] && [ "$TGW_ATTACH_FOR_VPC" != "None" ]; then
+            echo "     Detaching TGW attachment(s)..."
+            for TGW_ATTACH_ID in $TGW_ATTACH_FOR_VPC; do
+                # Check attachment state
+                ATTACH_STATE=$(aws ec2 describe-transit-gateway-attachments --region $REGION \
+                    --transit-gateway-attachment-ids "$TGW_ATTACH_ID" \
+                    --query "TransitGatewayAttachments[0].State" \
+                    --output text 2>/dev/null || echo "unknown")
+                
+                if [ "$ATTACH_STATE" != "deleted" ] && [ "$ATTACH_STATE" != "deleting" ]; then
+                    aws ec2 delete-transit-gateway-vpc-attachment --region $REGION \
+                        --transit-gateway-attachment-id "$TGW_ATTACH_ID" > /dev/null 2>&1 && \
+                        echo "     ✅ TGW attachment $TGW_ATTACH_ID deleted" || \
+                        echo "     ⚠️  TGW attachment $TGW_ATTACH_ID deletion failed"
+                else
+                    echo "     ℹ️  TGW attachment $TGW_ATTACH_ID already deleting"
+                fi
+            done
+            echo "     Waiting 15 seconds for TGW detachment to propagate..."
+            sleep 15
+        fi
+        
+        # 7b. Force delete any remaining ENIs (retry)
         ENI_COUNT=0
         for ENI_ID in $(aws ec2 describe-network-interfaces --region $REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
@@ -432,12 +685,12 @@ if [ -n "$REMAINING_VPCS" ]; then
         done
         [ $ENI_COUNT -gt 0 ] && echo "     ℹ️  Cleaned $ENI_COUNT ENI(s)"
         
-        # 7b. Force delete any VPC endpoints (retry)
+        # 7c. Force delete any VPC endpoints (retry)
         for ENDPOINT_ID in $(aws ec2 describe-vpc-endpoints --region $REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query "VpcEndpoints[].VpcEndpointId" --output text 2>/dev/null); do
             aws ec2 delete-vpc-endpoints --region $REGION \
-                --vpc-endpoint-ids $ENDPOINT_ID 2>/dev/null && \
+                --vpc-endpoint-ids $ENDPOINT_ID > /dev/null 2>&1 && \
                 echo "     • Deleted VPC Endpoint: $ENDPOINT_ID" || true
         done
         
@@ -446,13 +699,13 @@ if [ -n "$REMAINING_VPCS" ]; then
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query "Subnets[].SubnetId" --output text 2>/dev/null); do
             aws ec2 delete-subnet --region $REGION \
-                --subnet-id $SUBNET_ID 2>/dev/null && \
+                --subnet-id $SUBNET_ID > /dev/null 2>&1 && \
                 echo "     • Deleted Subnet: $SUBNET_ID" || true
         done
         
-        # 7d. Try to delete VPC again
+        # 7e. Try to delete VPC again
         sleep 2
-        aws ec2 delete-vpc --region $REGION --vpc-id $VPC_ID 2>/dev/null && \
+        aws ec2 delete-vpc --region $REGION --vpc-id $VPC_ID > /dev/null 2>&1 && \
             echo "     ✅ VPC deleted" || \
             echo "     ⚠️  VPC still has dependencies (will auto-delete soon)"
     done
@@ -465,17 +718,9 @@ echo ""
 # Step 8: Key Pairs
 # ────────────────────────────────────────────────────────────
 echo -e "${YELLOW}Step 8: Deleting Key Pairs...${NC}"
-aws ec2 delete-key-pair --region $REGION --key-name "pod${POD_NUMBER}-keypair" 2>/dev/null && \
+aws ec2 delete-key-pair --region $REGION --key-name "pod${POD_NUMBER}-keypair" > /dev/null 2>&1 && \
     echo "  ✅ Key pair deleted" || \
     echo "  ℹ️  Key pair not found (may already be deleted)"
-echo ""
-
-# ────────────────────────────────────────────────────────────
-# Step 9: Local Files
-# ────────────────────────────────────────────────────────────
-echo -e "${YELLOW}Step 9: Cleaning up local files...${NC}"
-rm -f "pod${POD_NUMBER}-private-key" 2>/dev/null && echo "  ✅ Private key removed" || true
-rm -f "pod${POD_NUMBER}-public-key" 2>/dev/null && echo "  ✅ Public key removed" || true
 echo ""
 
 # ────────────────────────────────────────────────────────────
@@ -564,13 +809,6 @@ if [ -f ".state-helper.sh" ]; then
     cleanup_pod_state "$POD_NUMBER"
 fi
     
-    # Clean up other local files for this pod
-    echo "🗑️  Cleaning up local files..."
-    rm -f "pod${POD_NUMBER}-private-key" "pod${POD_NUMBER}-private-key.pem" 2>/dev/null
-    rm -f "pod${POD_NUMBER}-keypair.pub" 2>/dev/null
-    echo "✅ Local cleanup complete"
-    echo ""
-    
     exit 0
 else
     # Resources remain - provide guidance
@@ -621,4 +859,4 @@ else
     echo "  # Cleanup leftovers:"
     echo "  ./cleanup/cleanup-direct.sh"
     echo ""
-
+fi

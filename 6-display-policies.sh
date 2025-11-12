@@ -541,7 +541,7 @@ echo "  # Expected: Success, inspected by IPS/WAF"
 echo ""
 
 echo -e "${YELLOW}Test 4: View Traffic in MCD Console${NC}"
-echo "  1. Login: https://defense.cisco.com"
+echo "  1. Login: https://security.cisco.com"
 echo "  2. Navigate: Observe → Traffic"
 echo "  3. Filter: pod${POD_NUMBER}"
 echo "  4. Look for: DLP blocks, IPS alerts, allowed traffic"
@@ -576,7 +576,7 @@ echo "  ✅ 2 Service Objects (HTTP, SSH)"
 echo "  ✅ 1 DLP Profile (SSN Protection)"
 echo ""
 
-echo -e "${BLUE}📖 For more details, check the MCD Console at https://defense.cisco.com${NC}"
+echo -e "${BLUE}📖 For more details, check the MCD Console at https://security.cisco.com${NC}"
 echo ""
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
