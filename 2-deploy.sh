@@ -552,61 +552,67 @@ if [ $APPLY_STATUS -eq 0 ]; then
     echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
     echo ""
     
-    # Check for tainted resources (provisioner failures)
-    echo -e "${BLUE}🔍 Verifying deployment integrity...${NC}"
-    TAINTED_RESOURCES=$(terraform state list 2>/dev/null | while read resource; do
-        terraform state show "$resource" 2>/dev/null | grep -q "Tainted: true" && echo "$resource"
-    done)
-    
-    if [ -n "$TAINTED_RESOURCES" ]; then
-        echo -e "${YELLOW}⚠️  WARNING: Some resources are marked as TAINTED${NC}"
-        echo ""
-        echo "Tainted resources (provisioner failures):"
-        echo "$TAINTED_RESOURCES" | while read res; do
-            echo "  ❌ $res"
-        done
-        echo ""
+    # Only check for tainted resources if apply had errors (provisioner failures)
+    # This check is SLOW, so we skip it for clean deployments
+    if echo "$APPLY_OUTPUT" | grep -qiE "(Error:|provisioner.*failed|remote-exec.*failed|Tainted: true)"; then
+        echo -e "${BLUE}🔍 Verifying deployment integrity...${NC}"
+        TAINTED_RESOURCES=$(terraform state list 2>/dev/null | while read resource; do
+            terraform state show "$resource" 2>/dev/null | grep -q "Tainted: true" && echo "$resource"
+        done)
         
-        # Auto-untaint App instances (they're functional even if provisioners failed)
-        APP_INSTANCES=$(echo "$TAINTED_RESOURCES" | grep "aws_instance.AppMachines")
-        JUMPBOX_INSTANCE=$(echo "$TAINTED_RESOURCES" | grep "aws_instance.jumpbox")
-        
-        if [ -n "$APP_INSTANCES" ] || [ -n "$JUMPBOX_INSTANCE" ]; then
-            echo -e "${BLUE}ℹ️  Auto-untainting instances (they're functional, just SSH provisioning failed)...${NC}"
+        if [ -n "$TAINTED_RESOURCES" ]; then
+            echo -e "${YELLOW}⚠️  WARNING: Some resources are marked as TAINTED${NC}"
             echo ""
-            
-            echo "$APP_INSTANCES" | while read res; do
-                if [ -n "$res" ]; then
-                    terraform untaint "$res" 2>&1 | grep -q "successfully" && \
-                        echo -e "  ${GREEN}✓${NC} Untainted $res" || \
-                        echo -e "  ${RED}✗${NC} Failed to untaint $res"
-                fi
-            done
-            
-            if [ -n "$JUMPBOX_INSTANCE" ]; then
-                terraform untaint "$JUMPBOX_INSTANCE" 2>&1 | grep -q "successfully" && \
-                    echo -e "  ${GREEN}✓${NC} Untainted $JUMPBOX_INSTANCE" || \
-                    echo -e "  ${RED}✗${NC} Failed to untaint $JUMPBOX_INSTANCE"
-            fi
-            
-            echo ""
-            echo -e "${GREEN}✓ Instances are now clean and won't be replaced on next deployment${NC}"
-            echo ""
-        fi
-        
-        # Check if any non-instance resources are still tainted
-        OTHER_TAINTED=$(echo "$TAINTED_RESOURCES" | grep -v "aws_instance")
-        if [ -n "$OTHER_TAINTED" ]; then
-            echo -e "${RED}⚠️  WARNING: Non-instance resources are still tainted:${NC}"
-            echo "$OTHER_TAINTED" | while read res; do
+            echo "Tainted resources (provisioner failures):"
+            echo "$TAINTED_RESOURCES" | while read res; do
                 echo "  ❌ $res"
             done
             echo ""
-            echo "These may need manual attention. Contact instructor if unsure."
+            
+            # Auto-untaint App instances (they're functional even if provisioners failed)
+            APP_INSTANCES=$(echo "$TAINTED_RESOURCES" | grep "aws_instance.AppMachines")
+            JUMPBOX_INSTANCE=$(echo "$TAINTED_RESOURCES" | grep "aws_instance.jumpbox")
+            
+            if [ -n "$APP_INSTANCES" ] || [ -n "$JUMPBOX_INSTANCE" ]; then
+                echo -e "${BLUE}ℹ️  Auto-untainting instances (they're functional, just SSH provisioning failed)...${NC}"
+                echo ""
+                
+                echo "$APP_INSTANCES" | while read res; do
+                    if [ -n "$res" ]; then
+                        terraform untaint "$res" 2>&1 | grep -q "successfully" && \
+                            echo -e "  ${GREEN}✓${NC} Untainted $res" || \
+                            echo -e "  ${RED}✗${NC} Failed to untaint $res"
+                    fi
+                done
+                
+                if [ -n "$JUMPBOX_INSTANCE" ]; then
+                    terraform untaint "$JUMPBOX_INSTANCE" 2>&1 | grep -q "successfully" && \
+                        echo -e "  ${GREEN}✓${NC} Untainted $JUMPBOX_INSTANCE" || \
+                        echo -e "  ${RED}✗${NC} Failed to untaint $JUMPBOX_INSTANCE"
+                fi
+                
+                echo ""
+                echo -e "${GREEN}✓ Instances are now clean and won't be replaced on next deployment${NC}"
+                echo ""
+            fi
+            
+            # Check if any non-instance resources are still tainted
+            OTHER_TAINTED=$(echo "$TAINTED_RESOURCES" | grep -v "aws_instance")
+            if [ -n "$OTHER_TAINTED" ]; then
+                echo -e "${RED}⚠️  WARNING: Non-instance resources are still tainted:${NC}"
+                echo "$OTHER_TAINTED" | while read res; do
+                    echo "  ❌ $res"
+                done
+                echo ""
+                echo "These may need manual attention. Contact instructor if unsure."
+                echo ""
+            fi
+        else
+            echo -e "${GREEN}✓ All resources are clean (no tainted resources)${NC}"
             echo ""
         fi
     else
-        echo -e "${GREEN}✓ All resources are clean (no tainted resources)${NC}"
+        echo -e "${GREEN}✓ Deployment completed cleanly (skipped integrity check)${NC}"
         echo ""
     fi
     
