@@ -1,9 +1,3 @@
-variable "aws_access_key" {
-  type        = string
-  description = "AWS Access Key"
-  sensitive   = true
-}
-
 variable "pod_number" {
   type        = number
   description = "Student pod number (1-50) - automatically configured by init-lab.sh"

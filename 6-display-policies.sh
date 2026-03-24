@@ -50,14 +50,11 @@ echo -e "${GREEN}✓ Pod Number: ${POD_NUMBER}${NC}"
 echo ""
 
 # Source AWS credentials if available
+if [ -f ".terraform/.aws-access.key" ]; then
+    export AWS_ACCESS_KEY_ID=$(cat .terraform/.aws-access.key)
+fi
 if [ -f ".terraform/.aws-secret.key" ]; then
     export AWS_SECRET_ACCESS_KEY=$(cat .terraform/.aws-secret.key)
-fi
-if [ -f "terraform.tfvars" ]; then
-    AWS_KEY=$(grep -E '^aws_access_key' terraform.tfvars 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' "')
-    if [ -n "$AWS_KEY" ]; then
-        export AWS_ACCESS_KEY_ID="$AWS_KEY"
-    fi
 fi
 
 # Track issues for diagnostics
@@ -738,4 +735,3 @@ echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━�
 echo -e "${BLUE}💡 Tip: Run this script anytime to check your lab status and diagnose issues${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-

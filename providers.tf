@@ -23,6 +23,7 @@ terraform {
 
 locals {
   _cred_dir = "${path.root}/.terraform"
+  _aws_access_file = "${local._cred_dir}/.aws-access.key"
   _aws_key_file = "${local._cred_dir}/.aws-secret.key"
   _mcd_api_file = "${local._cred_dir}/.mcd-api.json"
 }
@@ -34,6 +35,6 @@ provider "ciscomcd" {
 
 provider "aws" {
   region     = var.region
-  access_key = var.aws_access_key
+  access_key = trimspace(file(local._aws_access_file))
   secret_key = trimspace(file(local._aws_key_file))
 }
